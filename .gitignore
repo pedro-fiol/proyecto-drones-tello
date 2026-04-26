@@ -416,3 +416,33 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Python virtual environments
+.venv/
+.venv312/
+venv/
+env/
+
+# YOLO / ML model weights
+*.pt
+*.onnx
+*.weights
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# VS Code
+.vscode/
+
+# Claude / session files
+CLAUDE.md
+SESSION-*.md
+
+# Test scripts
+test_front_ToF
