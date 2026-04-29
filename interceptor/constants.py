@@ -12,7 +12,7 @@ FRAME_CENTER_Y       = FRAME_HEIGHT_PIXELS // 2   # 360
 
 # ---- YOLO / Detection ----
 YOLO_MODEL_PATH         = "yolov8s-pose.pt"
-YOLO_FRAME_STRIDE       = 2         # detection every N frames
+YOLO_FRAME_STRIDE       = 1         # detection every N frames
 YOLO_PERSON_CLASS_ID    = 0
 YOLO_CONFIDENCE_MIN     = 0.7
 

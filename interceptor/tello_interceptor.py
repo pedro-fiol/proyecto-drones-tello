@@ -4,8 +4,17 @@ import torch
 import threading
 import time
 from djitellopy import Tello, TelloException
-from ultralytics import YOLO
-from .constants import FRAME_CENTER_X, FRAME_CENTER_Y
+from .perception import Person, PersonDetector
+
+
+
+from .constants import (
+    FRAME_CENTER_X, FRAME_CENTER_Y,
+    YOLO_FRAME_STRIDE, YOLO_CONFIDENCE_MIN, YOLO_PERSON_CLASS_ID,
+    NOSE_KEYPOINT_INDEX, NOSE_CONFIDENCE_THRESHOLD,
+)
+
+
 from .hud_overlay import (
     draw_detection_state,
     draw_frame_crosshair,
@@ -18,11 +27,7 @@ os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
 import logging
 logging.getLogger("djitellopy").setLevel(logging.WARNING)
 
-DEVICE              = "cuda" if torch.cuda.is_available() else "cpu"
-DEVICE_STR          = DEVICE.upper()   # "CUDA" or "CPU" for HUD
-YOLO_STRIDE         = 2
-NOSE_IDX            = 0      # nose = keypoint 0 in COCO format
-NOSE_CONF_THRESHOLD = 0.7    # min confidence to consider face visible
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 print(f"[INFO] Using device: {DEVICE}")
 
@@ -51,11 +56,8 @@ class TelloInterceptor:
         self.min_temp_C = -1.0
         self.max_temp_C = -1.0
 
-        self.model_pose = YOLO("yolov8s-pose.pt")   # person + keypoints
-        self.model_pose.to(DEVICE)
+        self.person_detector = PersonDetector(device=DEVICE)
 
-        # self.model_obj = YOLO("yolov8s.pt")        # objects — uncomment when needed
-        # self.model_obj.to(DEVICE)
 
     def start(self):
         self.tello.connect()
@@ -104,7 +106,7 @@ class TelloInterceptor:
         frame_reader = self.tello.get_frame_read()
 
         frame_count    = 0
-        last_persons   = []    # (x1, y1, x2, y2, conf, face_visible, nose_x, nose_y)
+        last_persons: list[Person] = []
         frame_center_x = FRAME_CENTER_X
         frame_center_y = FRAME_CENTER_Y
 
@@ -121,30 +123,8 @@ class TelloInterceptor:
             frame_count += 1
 
             # --- Pose detection every YOLO_STRIDE frames ---
-            if frame_count % YOLO_STRIDE == 0:
-                results = self.model_pose(
-                    frame,
-                    classes=[0],    # person only
-                    conf=0.7,
-                    verbose=False
-                )
-                last_persons.clear()
-                for r in results:
-                    for i, box in enumerate(r.boxes):
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        conf = float(box.conf[0])
-
-                        face_visible = False
-                        nose_x, nose_y = None, None
-                        if r.keypoints is not None and i < len(r.keypoints):
-                            kp        = r.keypoints[i]
-                            nose_conf = float(kp.conf[0][NOSE_IDX])
-                            if nose_conf > NOSE_CONF_THRESHOLD:
-                                face_visible = True
-                                nose_x = int(kp.xy[0][NOSE_IDX][0])
-                                nose_y = int(kp.xy[0][NOSE_IDX][1])
-
-                        last_persons.append((x1, y1, x2, y2, conf, face_visible, nose_x, nose_y))
+            if frame_count % YOLO_FRAME_STRIDE == 0:
+                last_persons = self.person_detector.detect_persons_in_frame(frame)
 
             # --- Draw detections + HUD ---
             target_center_x, target_center_y, tracking_face = draw_person_overlays(frame, last_persons)

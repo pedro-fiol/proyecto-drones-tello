@@ -12,6 +12,10 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from interceptor.perception import Person
 
 
 # ---- HUD layout constants ----
@@ -26,7 +30,7 @@ COLOR_TELEMETRY_PRIMARY = (0, 200, 255)
 COLOR_TELEMETRY_SECONDARY = (150, 150, 255)
 
 
-def draw_person_overlays(frame: np.ndarray, persons: list[tuple]) -> tuple:
+def draw_person_overlays(frame: np.ndarray, persons: list[Person]) -> tuple:
     """
     Draw bbox + label + nose dot for every detected person.
 
@@ -37,25 +41,26 @@ def draw_person_overlays(frame: np.ndarray, persons: list[tuple]) -> tuple:
     target_center_y: int | None = None
     tracking_face = False
 
-    for (x1, y1, x2, y2, conf, face_visible, nose_x, nose_y) in persons:
-        if face_visible:
+    for person in persons:
+        if person.face_visible:
             color = COLOR_FACE_BOX
-            label = f"FACE {conf:.2f}"
-            target_center_x, target_center_y = nose_x, nose_y
+            label = f"FACE {person.bbox_confidence:.2f}"
+            target_center_x = person.nose.x
+            target_center_y = person.nose.y
             tracking_face = True
         else:
             color = COLOR_BODY_BOX
-            label = f"BACK {conf:.2f}"
+            label = f"BACK {person.bbox_confidence:.2f}"
             if target_center_x is None:
-                target_center_x = (x1 + x2) // 2
-                target_center_y = (y1 + y2) // 2
+                target_center_x = person.bbox_center_x
+                target_center_y = person.bbox_center_y
 
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(frame, label, (x1, y1 - 8),
+        cv2.rectangle(frame, (person.x1, person.y1), (person.x2, person.y2), color, 2)
+        cv2.putText(frame, label, (person.x1, person.y1 - 8),
                     HUD_FONT, 0.55, color, 1)
 
-        if face_visible and nose_x is not None:
-            cv2.circle(frame, (nose_x, nose_y), 6, COLOR_FACE_BOX, -1)
+        if person.face_visible and person.nose is not None:
+            cv2.circle(frame, (person.nose.x, person.nose.y), 6, COLOR_FACE_BOX, -1)
 
     return target_center_x, target_center_y, tracking_face
 
