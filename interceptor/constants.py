@@ -20,7 +20,7 @@ NOSE_KEYPOINT_INDEX = 0         # COCO keypoint index for nose
 NOSE_CONFIDENCE_THRESHOLD = 0.7  # min conf to consider face visible
 
 # ---- Altitude (cm) ----
-TARGET_ALTITUDE_CM       = 150
+TARGET_ALTITUDE_CM       = 100
 GEOFENCE_MAX_ALTITUDE_CM = 200
 GEOFENCE_MIN_ALTITUDE_CM = 20
 
@@ -45,7 +45,7 @@ SEARCH_MAX_ADVANCE_TOTAL_CM     = 300 # distancia total volada por el dron en un
 
 
 # ---- PID gains (kp, ki, kd) ----
-GAINS_ALTITUDE_PID          = (0.25, 0.003, 0.45)   # cm error  → ud
+GAINS_ALTITUDE_PID          = (1.5, 0.08, 0.4)   # cm error  → ud
 GAINS_YAW_PID               = (0.15, 0.000, 0.25)   # px error  → yaw
 GAINS_FORWARD_BACK_TOF_PID  = (0.40, 0.003, 0.20)   # cm error  → fb
 GAINS_FORWARD_BACK_BBOX_PID = (90.0, 0.000, 30.0)   # ratio err → fb # solo si front ToF falla.
