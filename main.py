@@ -5,8 +5,11 @@ from interceptor.tello_interceptor import TelloInterceptor
 
 import traceback
 
+# PHANTOM = True → drone never takes off, all logic dry-runs in HUD. Use for testing PID + YOLO.
+PHANTOM = False
+
 def main():
-    dron = TelloInterceptor()
+    dron = TelloInterceptor(phantom_mode=PHANTOM)
     try:
         dron.start()
     except Exception:

@@ -10,9 +10,13 @@ from .pid_controller import PIDController
 from .perception import Person, PersonDetector
 
 
-
 from .constants import (
-    FRAME_CENTER_X, FRAME_CENTER_Y, GAINS_ALTITUDE_PID, GEOFENCE_MAX_ALTITUDE_CM, RC_LOOP_INTERVAL_S, TARGET_ALTITUDE_CM,
+    FRAME_CENTER_X, FRAME_CENTER_Y,
+    FACE_TARGET_Y_RATIO, FACE_LOST_GRACE_S, FACE_Y_EMA_ALPHA,
+    GAINS_ALTITUDE_PID, GAINS_ALTITUDE_FACE_PID,
+    GEOFENCE_MAX_ALTITUDE_CM, GEOFENCE_MIN_ALTITUDE_CM,
+    MIN_TRACKING_ALTITUDE_CM,
+    RC_LOOP_INTERVAL_S, TARGET_ALTITUDE_CM, UD_MAX_VELOCITY_CM_S,
     YOLO_FRAME_STRIDE, YOLO_CONFIDENCE_MIN, YOLO_PERSON_CLASS_ID,
     NOSE_KEYPOINT_INDEX, NOSE_CONFIDENCE_THRESHOLD,
 )
@@ -20,8 +24,10 @@ from .constants import (
 
 from .hud_overlay import (
     draw_detection_state,
+    draw_face_target_line,
     draw_frame_crosshair,
     draw_person_overlays,
+    draw_phantom_badge,
     draw_telemetry_strip,
 )
 
@@ -36,7 +42,10 @@ print(f"[INFO] Using device: {DEVICE}")
 
 
 class TelloInterceptor:
-    def __init__(self):
+    def __init__(self, phantom_mode: bool = False):
+        # Phantom: drone never takes off, send_rc_control is no-op. Camera + YOLO + PID + HUD
+        # all run normally so logic can be validated without flight risk.
+        self.phantom_mode = phantom_mode
         self.tello        = Tello()
         self._sdk_lock    = threading.Lock()
         self._stop_finished = False
@@ -62,11 +71,27 @@ class TelloInterceptor:
         self.person_detector = PersonDetector(device=DEVICE)
 
         self.rc_loop_active = False
-        self.altitude_pid = PIDController(*GAINS_ALTITUDE_PID, output_min=-100, output_max=100)
+        self.altitude_pid = PIDController(*GAINS_ALTITUDE_PID,
+                                          output_min=-UD_MAX_VELOCITY_CM_S, output_max=UD_MAX_VELOCITY_CM_S)
+        self.altitude_face_pid = PIDController(*GAINS_ALTITUDE_FACE_PID,
+                                               output_min=-UD_MAX_VELOCITY_CM_S, output_max=UD_MAX_VELOCITY_CM_S)
         self.rc = [0, 0, 0, 0]  # lr, fb, ud, yaw
 
         self._altitude_log: list[tuple] = []
         self._log_start_time: float = 0.0
+
+        # Face-loss hysteresis — last wall-clock time face was detected
+        self._last_face_seen_time: float = 0.0
+
+        # EMA-smoothed nose_y for altitude PID (kills YOLO ±5px jitter)
+        self._face_y_smoothed: float = 0.0
+        self._face_y_ema_initialized: bool = False
+
+        # Mission pad telemetry (downward camera). -1 = no pad in view.
+        self.mission_pad_id: int = -1
+        self.mission_pad_x_cm: float = 0.0
+        self.mission_pad_y_cm: float = 0.0
+        self.mission_pad_z_cm: float = 0.0
 
     def start(self):
         print("[INFO] Connecting to Tello...")
@@ -88,11 +113,15 @@ class TelloInterceptor:
 
         print("[INFO] Starting video stream...")
         self.tello.streamon()
-        print("[INFO] Taking off...")
-        # takeoff BEFORE background threads — blocks ~5–20 s, avoids EXT tof? colliding mid-takeoff
-        with self._sdk_lock:
-            self.tello.takeoff()
-        print("[INFO] Airborne.")
+
+        if self.phantom_mode:
+            print("[INFO] PHANTOM mode — skipping takeoff. Logic dry-run only.")
+        else:
+            print("[INFO] Taking off...")
+            # takeoff BEFORE background threads — blocks ~5–20 s, avoids EXT tof? colliding mid-takeoff
+            with self._sdk_lock:
+                self.tello.takeoff()
+            print("[INFO] Airborne.")
 
         self._log_start_time = time.time()
         self.video_active = True
@@ -118,11 +147,12 @@ class TelloInterceptor:
 
         time.sleep(1.5)  # > EXT tof? timeout (1s) so ToF thread fully exits
 
-        try:
-            with self._sdk_lock:
-                self.tello.land()
-        except TelloException:
-            pass
+        if not self.phantom_mode:
+            try:
+                with self._sdk_lock:
+                    self.tello.land()
+            except TelloException:
+                pass
 
         time.sleep(0.6)
         try:
@@ -146,7 +176,7 @@ class TelloInterceptor:
         path = "logs/altitude_response.csv"
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["time_s", "height_cm", "error_cm", "ud_command"])
+            writer.writerow(["time_s", "height_cm", "error", "ud_command", "mode"])
             writer.writerows(self._altitude_log)
         print(f"[INFO] Altitude log saved → {path}")
 
@@ -168,6 +198,7 @@ class TelloInterceptor:
             h, w = frame.shape[:2]
             frame_center_x = w // 2
             frame_center_y = h // 2
+            face_target_y  = int(h * FACE_TARGET_Y_RATIO)  # upper-third framing
 
             frame_count += 1
 
@@ -176,28 +207,81 @@ class TelloInterceptor:
                 last_persons = self.person_detector.detect_persons_in_frame(frame)
 
 
-            # PID control    
-            error_altitude = TARGET_ALTITUDE_CM - self.height_cm
-            ud = self.altitude_pid.compute(error_altitude, RC_LOOP_INTERVAL_S)
-            
-            if self.height_cm >= GEOFENCE_MAX_ALTITUDE_CM:
-                ud = min(ud, 0)  # only allow downward movement
-            
-            self.rc[2] = int(round(ud))  # set vertical speed command
+
+             # --- HUD overlays ---
+
+            target_center_x, target_center_y, tracking_face = draw_person_overlays(frame, last_persons)
+            draw_frame_crosshair(frame, frame_center_x, frame_center_y)
+            draw_face_target_line(frame, face_target_y)
+            target_y_reference = face_target_y if tracking_face else frame_center_y
+            draw_detection_state(frame, target_center_x, target_center_y, frame_center_x, target_y_reference, tracking_face)
+            draw_telemetry_strip(frame, self)
+            if self.phantom_mode:
+                draw_phantom_badge(frame)
+
+
+
+            # --- Altitude PID with face-loss hysteresis ---
+            # Three modes:
+            #   FACE   — face visible, park nose at upper-third Y
+            #   HOVER  — face lost <FACE_LOST_GRACE_S ago, ud=0 (Tello holds via baro+optical-flow)
+            #   BARO   — face lost >grace, search altitude via TARGET_ALTITUDE_CM
+            # Hysteresis stops the face/baro PID fight that caused 158 mode switches last run.
+            tracking_face = tracking_face and target_center_y is not None
+            now = time.time()
+            if tracking_face:
+                self._last_face_seen_time = now
+            since_face_seen = now - self._last_face_seen_time
+            in_grace = (not tracking_face) and (since_face_seen < FACE_LOST_GRACE_S) and self._last_face_seen_time > 0
+
+            if tracking_face:
+                # EMA smooth nose_y to kill YOLO jitter before differentiating
+                if not self._face_y_ema_initialized:
+                    self._face_y_smoothed = float(target_center_y)
+                    self._face_y_ema_initialized = True
+                else:
+                    self._face_y_smoothed = (FACE_Y_EMA_ALPHA * target_center_y +
+                                             (1.0 - FACE_Y_EMA_ALPHA) * self._face_y_smoothed)
+                error_altitude = self._face_y_smoothed - face_target_y  # px, +ve = face below target
+                self.altitude_pid.reset_integral()
+                ud = self.altitude_face_pid.compute(error_altitude, RC_LOOP_INTERVAL_S)
+                mode_label = "face"
+            elif in_grace:
+                error_altitude = 0.0
+                ud = 0.0  # hover — let Tello hold altitude itself
+                self.altitude_pid.reset_integral()
+                self.altitude_face_pid.reset_integral()
+                self._face_y_ema_initialized = False  # next face = fresh EMA
+                mode_label = "hover"
+            else:
+                error_altitude = TARGET_ALTITUDE_CM - self.height_cm  # cm
+                self.altitude_face_pid.reset_integral()
+                self._face_y_ema_initialized = False
+                ud = self.altitude_pid.compute(error_altitude, RC_LOOP_INTERVAL_S)
+                mode_label = "baro"
+
+            # Tracking floor — face PID can pull drone DOWN into ground effect / propwash zone.
+            # Block descent below MIN_TRACKING_ALTITUDE_CM. Climb still allowed.
+            if self.height_cm <= MIN_TRACKING_ALTITUDE_CM and ud < 0:
+                ud = 0
+
+            # Geofence clamps (independent of PID)
+            if self.height_cm >= GEOFENCE_MAX_ALTITUDE_CM and ud > 0:
+                ud = 0
+            if 0 < self.height_cm <= GEOFENCE_MIN_ALTITUDE_CM and ud < 0:
+                ud = 0
+
+            self.rc[2] = int(round(ud))
+
             self._altitude_log.append((
                 time.time() - self._log_start_time,
                 self.height_cm,
                 error_altitude,
                 ud,
+                mode_label,
             ))
 
-            # --- Draw detections + HUD ---
-            target_center_x, target_center_y, tracking_face = draw_person_overlays(frame, last_persons)
-            draw_frame_crosshair(frame, frame_center_x, frame_center_y)
-            draw_detection_state(frame, target_center_x, target_center_y,
-                                 frame_center_x, frame_center_y, tracking_face)
-            draw_telemetry_strip(frame, self)
-
+           
             cv2.imshow("TelloInterceptor", frame)
             if cv2.waitKey(1) & 0xFF == 27:  # ESC key
                 self.video_active = False  # exits loop; threads also see flag before stop().land()
@@ -209,17 +293,27 @@ class TelloInterceptor:
         """Background thread: read front ToF + down ToF as fast as possible."""
         while self.front_tof_active:
             try:
+
+                # frontward ToF
                 with self._sdk_lock:
                     raw = self.tello.send_command_with_return("EXT tof?", timeout=1)
-
                 if raw and raw.strip().startswith("tof "):
                     mm = int(raw.strip().split()[1])
                     self.front_tof_cm = -1.0 if mm >= 8190 else mm / 10.0
 
-                # down ToF lives in the UDP state stream — cheap dict lookup, no SDK call
+                # downward ToF
                 state = self.tello.get_current_state()
                 if state:
                     self.down_tof_cm = state.get("tof", -1)
+                
+                # ToF or barometer height?
+                baro_height_cm = state.get("h", -1) if state else -1
+
+                if self.down_tof_cm > baro_height_cm: 
+                    self.height_cm = self.down_tof_cm
+                else:
+                    self.height_cm = baro_height_cm
+
             except Exception:
                 pass
 
@@ -228,7 +322,6 @@ class TelloInterceptor:
             try:
                 state = self.tello.get_current_state()
                 if state:
-                    self.height_cm       = state.get("h",   -1)
                     self.pitch_deg       = state.get("pitch", -1)
                     self.roll_deg        = state.get("roll",  -1)
                     self.yaw_deg         = state.get("yaw",   -1)
@@ -242,9 +335,12 @@ class TelloInterceptor:
                     self.min_temp_C = state.get("templ",  -1)
                     self.max_temp_C = state.get("temph",  -1)
 
-                 # si no esta sobrevolando ningún obstáculo, usar el down ToF como altura (más confiable que el barómetro)
-                if self.down_tof_cm > self.height_cm:
-                    self.height_cm = self.down_tof_cm
+                    # Mission pad — `mid` = -1 when no pad detected. x/y/z in cm relative to pad center.
+                    self.mission_pad_id   = state.get("mid", -1)
+                    self.mission_pad_x_cm = state.get("x",   0)
+                    self.mission_pad_y_cm = state.get("y",   0)
+                    self.mission_pad_z_cm = state.get("z",   0)
+
 
             except Exception:
                 pass
@@ -252,8 +348,13 @@ class TelloInterceptor:
 
     # Thread: runs at 20 Hz, just sends rc[]. No computation here.
     def _rc_control_loop(self) -> None:
-        """Send RC commands to drone at 20 Hz independent of video FPS."""
+        """Send RC commands to drone at 20 Hz independent of video FPS.
+
+        In phantom mode, becomes a pure no-op — rc[] still updates from video loop
+        and shows in HUD, but never reaches the drone.
+        """
         while self.rc_loop_active:
-            with self._sdk_lock:
-                self.tello.send_rc_control(*self.rc)
+            if not self.phantom_mode:
+                with self._sdk_lock:
+                    self.tello.send_rc_control(*self.rc)
             time.sleep(RC_LOOP_INTERVAL_S)  # 0.05 s → 20 Hz

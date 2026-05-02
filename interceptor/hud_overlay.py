@@ -29,7 +29,6 @@ COLOR_STATE_TEXT = (0, 255, 255)
 COLOR_TELEMETRY_PRIMARY = (0, 200, 255)
 COLOR_TELEMETRY_SECONDARY = (150, 150, 255)
 
-
 def draw_person_overlays(frame: np.ndarray, persons: list[Person]) -> tuple:
     """
     Draw bbox + label + nose dot for every detected person.
@@ -70,18 +69,36 @@ def draw_frame_crosshair(frame: np.ndarray, center_x: int, center_y: int) -> Non
     cv2.circle(frame, (center_x, center_y), 6, COLOR_CROSSHAIR, -1)
 
 
+def draw_face_target_line(frame: np.ndarray, target_y: int) -> None:
+    """Horizontal green line marking the desired face Y position (upper-third framing)."""
+    h, w = frame.shape[:2]
+    cv2.line(frame, (0, target_y), (w, target_y), COLOR_FACE_BOX, 1)
+
+
+def draw_phantom_badge(frame: np.ndarray) -> None:
+    """Big green PHANTOM badge top-right — impossible to miss when dry-running."""
+    h, w = frame.shape[:2]
+    cv2.putText(frame, "PHANTOM", (w - 220, 50),
+                HUD_FONT, 1.0, COLOR_FACE_BOX, 3)
+
+
 def draw_detection_state(
     frame: np.ndarray,
     target_center_x: int | None,
     target_center_y: int | None,
     frame_center_x: int,
-    frame_center_y: int,
+    target_y_reference: int,
     tracking_face: bool,
 ) -> None:
-    """Draw the tracking state label and pixel error vector at the top of the frame."""
+    """Draw the tracking state label and pixel error vector at the top of the frame.
+
+    target_y_reference is the desired face Y when tracking_face, frame center Y otherwise.
+    """
     if target_center_x is not None:
         err_x = target_center_x - frame_center_x
-        err_y = target_center_y - frame_center_y
+        err_y = target_center_y - target_y_reference
+    
+
         state_label = "FACE" if tracking_face else "BODY"
         cv2.putText(frame, f"{state_label}  err=({err_x:+d},{err_y:+d}px)",
                     (10, HUD_LINE_HEIGHT_PIXELS), HUD_FONT, 0.65, COLOR_STATE_TEXT, 2)
