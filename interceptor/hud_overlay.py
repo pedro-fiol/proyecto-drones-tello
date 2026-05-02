@@ -117,36 +117,36 @@ def draw_telemetry_strip(frame: np.ndarray, interceptor) -> None:
     x_accel_cm_s2, y_accel_cm_s2, z_accel_cm_s2,
     min_temp_C, max_temp_C.
     """
-    lh = HUD_LINE_HEIGHT_PIXELS
+    line_height = HUD_LINE_HEIGHT_PIXELS
 
     cv2.putText(frame, f"Battery: {interceptor.battery_percent:.0f}%",
-                (10, lh * 2), HUD_FONT, 0.6, COLOR_TELEMETRY_PRIMARY, 1)
+                (10, line_height * 2), HUD_FONT, 0.6, COLOR_TELEMETRY_PRIMARY, 1)
     cv2.putText(frame, f"Height:  {interceptor.height_cm:.0f} cm",
-                (10, lh * 3), HUD_FONT, 0.6, COLOR_TELEMETRY_PRIMARY, 1)
+                (10, line_height * 3), HUD_FONT, 0.6, COLOR_TELEMETRY_PRIMARY, 1)
     cv2.putText(frame, f"Front ToF:     {interceptor.front_tof_cm:.0f} cm",
-                (10, lh * 4), HUD_FONT, 0.6, COLOR_TELEMETRY_PRIMARY, 1)
+                (10, line_height * 4), HUD_FONT, 0.6, COLOR_TELEMETRY_PRIMARY, 1)
     cv2.putText(frame, f"Down ToF:     {interceptor.down_tof_cm:.0f} cm",
-                (10, lh * 5), HUD_FONT, 0.6, COLOR_TELEMETRY_PRIMARY, 1)
+                (10, line_height * 5), HUD_FONT, 0.6, COLOR_TELEMETRY_PRIMARY, 1)
     cv2.putText(frame, f"Yaw:     {interceptor.yaw_deg:.0f} deg",
-                (10, lh * 6), HUD_FONT, 0.6, COLOR_TELEMETRY_PRIMARY, 1)
+                (10, line_height * 6), HUD_FONT, 0.6, COLOR_TELEMETRY_PRIMARY, 1)
     cv2.putText(frame, f"Pitch:   {interceptor.pitch_deg:.0f} deg",
-                (10, lh * 7), HUD_FONT, 0.6, COLOR_TELEMETRY_PRIMARY, 1)
+                (10, line_height * 7), HUD_FONT, 0.6, COLOR_TELEMETRY_PRIMARY, 1)
     cv2.putText(frame, f"Roll:    {interceptor.roll_deg:.0f} deg",
-                (10, lh * 8), HUD_FONT, 0.6, COLOR_TELEMETRY_PRIMARY, 1)
+                (10, line_height * 8), HUD_FONT, 0.6, COLOR_TELEMETRY_PRIMARY, 1)
 
     cv2.putText(frame, f"Vx: {interceptor.x_speed_dm_s:.0f} dm/s",
-                (10, lh * 9), HUD_FONT, 0.55, COLOR_TELEMETRY_SECONDARY, 1)
+                (10, line_height * 9), HUD_FONT, 0.55, COLOR_TELEMETRY_SECONDARY, 1)
     cv2.putText(frame, f"Vy: {interceptor.y_speed_dm_s:.0f} dm/s",
-                (10, lh * 10), HUD_FONT, 0.55, COLOR_TELEMETRY_SECONDARY, 1)
+                (10, line_height * 10), HUD_FONT, 0.55, COLOR_TELEMETRY_SECONDARY, 1)
     cv2.putText(frame, f"Vz: {interceptor.z_speed_dm_s:.0f} dm/s",
-                (10, lh * 11), HUD_FONT, 0.55, COLOR_TELEMETRY_SECONDARY, 1)
+                (10, line_height * 11), HUD_FONT, 0.55, COLOR_TELEMETRY_SECONDARY, 1)
     cv2.putText(frame, f"Ax: {interceptor.x_accel_cm_s2:.0f} cm/s2",
-                (10, lh * 12), HUD_FONT, 0.55, COLOR_TELEMETRY_SECONDARY, 1)
+                (10, line_height * 12), HUD_FONT, 0.55, COLOR_TELEMETRY_SECONDARY, 1)
     cv2.putText(frame, f"Ay: {interceptor.y_accel_cm_s2:.0f} cm/s2",
-                (10, lh * 13), HUD_FONT, 0.55, COLOR_TELEMETRY_SECONDARY, 1)
+                (10, line_height * 13), HUD_FONT, 0.55, COLOR_TELEMETRY_SECONDARY, 1)
     cv2.putText(frame, f"Az: {interceptor.z_accel_cm_s2:.0f} cm/s2",
-                (10, lh * 14), HUD_FONT, 0.55, COLOR_TELEMETRY_SECONDARY, 1)
+                (10, line_height * 14), HUD_FONT, 0.55, COLOR_TELEMETRY_SECONDARY, 1)
     cv2.putText(frame, f"Min Temp: {interceptor.min_temp_C:.0f} C",
-                (10, lh * 15), HUD_FONT, 0.55, COLOR_TELEMETRY_SECONDARY, 1)
+                (10, line_height * 15), HUD_FONT, 0.55, COLOR_TELEMETRY_SECONDARY, 1)
     cv2.putText(frame, f"Max Temp: {interceptor.max_temp_C:.0f} C",
-                (200, lh * 15), HUD_FONT, 0.55, COLOR_TELEMETRY_SECONDARY, 1)
+                (200, line_height * 15), HUD_FONT, 0.55, COLOR_TELEMETRY_SECONDARY, 1)
