@@ -1,3 +1,10 @@
+# Silence PyAV / FFmpeg H264 decoder warnings (e.g. "non-existing PPS 0 referenced",
+# "no frame!", "error while decoding MB ...") that spam during the first second of
+# stream while the decoder waits for an I-frame. Must be done before djitellopy
+# (which imports av) loads its decoder thread.
+import av.logging
+av.logging.set_level(av.logging.PANIC)
+
 from interceptor.tello_interceptor import TelloInterceptor
 
 # powershell -ExecutionPolicy Bypass -File switch-tello.ps1 tello

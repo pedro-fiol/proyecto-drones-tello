@@ -4,18 +4,20 @@ interceptor/hud_overlay.py
 Pure OpenCV drawing functions for the video HUD overlay.
 No Tello SDK calls, no threading, no state — just frame annotation.
 
-Person tuples follow the format used by TelloInterceptor:
-    (x1, y1, x2, y2, conf, face_visible, nose_x, nose_y)
+`draw_person_overlays` selects which Person is the tracking target using the
+provided Target instance (see interceptor.target). Tracked person is also
+returned so the orchestrator can read its bbox dimensions for pitch fallback.
 """
 
 from __future__ import annotations
 
 import cv2
 import numpy as np
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from interceptor.perception import Person
+    from interceptor.target import Target
 
 
 # ---- HUD layout constants ----
@@ -29,39 +31,50 @@ COLOR_STATE_TEXT = (0, 255, 255)
 COLOR_TELEMETRY_PRIMARY = (0, 200, 255)
 COLOR_TELEMETRY_SECONDARY = (150, 150, 255)
 
-def draw_person_overlays(frame: np.ndarray, persons: list[Person]) -> tuple:
+def draw_person_overlays(
+    frame: np.ndarray,
+    persons: "list[Person]",
+    target: "Target",
+) -> tuple:
     """
-    Draw bbox + label + nose dot for every detected person.
+    Draw bbox + label + target dot for every detected person.
 
-    Returns the chosen tracking target as (target_center_x, target_center_y, tracking_face).
-    Face-visible persons take priority; otherwise falls back to the first body bbox.
+    Returns (target_x, target_y, tracking, tracked_person):
+        target_x, target_y — pixel coords of the active target on the chosen
+            person, or (None, None) when no person passes target.is_visible.
+        tracking — True when at least one person passed target.is_visible.
+        tracked_person — the Person whose target is active (for tracking),
+            or the first body bbox as fallback (for bbox-PID distance proxy),
+            or None if no persons at all.
+
+    Visible-target persons take priority over body-only ones for `tracked_person`.
     """
-    target_center_x: int | None = None
-    target_center_y: int | None = None
-    tracking_face = False
+    target_x: Optional[int] = None
+    target_y: Optional[int] = None
+    tracking = False
+    tracked_person: Optional["Person"] = None
 
     for person in persons:
-        if person.face_visible:
+        if target.is_visible(person):
             color = COLOR_FACE_BOX
-            label = f"FACE {person.bbox_confidence:.2f}"
-            target_center_x = person.nose.x
-            target_center_y = person.nose.y
-            tracking_face = True
+            label = f"{target.name.upper()} {person.bbox_confidence:.2f}"
+            target_x, target_y = target.point(person)
+            tracking = True
+            tracked_person = person
         else:
             color = COLOR_BODY_BOX
             label = f"BACK {person.bbox_confidence:.2f}"
-            if target_center_x is None:
-                target_center_x = person.bbox_center_x
-                target_center_y = person.bbox_center_y
+            if tracked_person is None:
+                tracked_person = person   # bbox-only fallback for pitch distance
 
         cv2.rectangle(frame, (person.x1, person.y1), (person.x2, person.y2), color, 2)
         cv2.putText(frame, label, (person.x1, person.y1 - 8),
                     HUD_FONT, 0.55, color, 1)
 
-        if person.face_visible and person.nose is not None:
-            cv2.circle(frame, (person.nose.x, person.nose.y), 6, COLOR_FACE_BOX, -1)
+        if tracking and person is tracked_person and target_x is not None:
+            cv2.circle(frame, (target_x, target_y), 6, COLOR_FACE_BOX, -1)
 
-    return target_center_x, target_center_y, tracking_face
+    return target_x, target_y, tracking, tracked_person
 
 
 def draw_frame_crosshair(frame: np.ndarray, center_x: int, center_y: int) -> None:
@@ -69,8 +82,8 @@ def draw_frame_crosshair(frame: np.ndarray, center_x: int, center_y: int) -> Non
     cv2.circle(frame, (center_x, center_y), 6, COLOR_CROSSHAIR, -1)
 
 
-def draw_face_target_line(frame: np.ndarray, target_y: int) -> None:
-    """Horizontal green line marking the desired face Y position (upper-third framing)."""
+def draw_target_y_line(frame: np.ndarray, target_y: int) -> None:
+    """Horizontal green line marking the desired target Y position (drives altitude PID setpoint)."""
     h, w = frame.shape[:2]
     cv2.line(frame, (0, target_y), (w, target_y), COLOR_FACE_BOX, 1)
 
@@ -88,18 +101,18 @@ def draw_detection_state(
     target_center_y: int | None,
     frame_center_x: int,
     target_y_reference: int,
-    tracking_face: bool,
+    tracking_target: bool,
+    target_name: str = "TARGET",
 ) -> None:
     """Draw the tracking state label and pixel error vector at the top of the frame.
 
-    target_y_reference is the desired face Y when tracking_face, frame center Y otherwise.
+    target_y_reference is the desired target Y when tracking_target, frame center Y otherwise.
     """
     if target_center_x is not None:
         err_x = target_center_x - frame_center_x
         err_y = target_center_y - target_y_reference
-    
 
-        state_label = "FACE" if tracking_face else "BODY"
+        state_label = target_name.upper() if tracking_target else "BODY"
         cv2.putText(frame, f"{state_label}  err=({err_x:+d},{err_y:+d}px)",
                     (10, HUD_LINE_HEIGHT_PIXELS), HUD_FONT, 0.65, COLOR_STATE_TEXT, 2)
     else:
