@@ -8,6 +8,7 @@ av.logging.set_level(av.logging.PANIC)
 from interceptor.tello_interceptor import TelloInterceptor
 
 # powershell -ExecutionPolicy Bypass -File switch-tello.ps1 tello
+# powershell -ExecutionPolicy Bypass -File switch-tello.ps1 dual
 # powershell -ExecutionPolicy Bypass -File switch-tello.ps1 lan
 
 import traceback

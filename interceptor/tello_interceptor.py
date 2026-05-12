@@ -1,4 +1,6 @@
 import csv
+import ctypes
+import ctypes.wintypes
 import os
 import cv2
 import torch
@@ -13,20 +15,57 @@ from .target import TARGET, select_best_person
 
 
 from .constants import (
-    TARGET_EMA_ALPHA, FB_MAX_VELOCITY_CM_S, FRAME_CENTER_X, FRAME_CENTER_Y,
-    FRAME_HEIGHT_PIXELS,
+    FRONT_TOF_WALL_BACKOFF_CM, TARGET_EMA_ALPHA, FB_MAX_VELOCITY_CM_S, FRAME_CENTER_X, FRAME_CENTER_Y,
     TARGET_LOST_GRACE_S, FRONT_TOF_WALL_STOP_CM,
     GAINS_ALTITUDE_PID, GAINS_ALTITUDE_TARGET_PID,
     GAINS_FORWARD_BACK_TOF_PID, GAINS_FORWARD_BACK_BBOX_PID, GAINS_YAW_PID,
-    GEOFENCE_MAX_ALTITUDE_CM, GEOFENCE_MIN_ALTITUDE_CM, INTERCEPT_DISTANCE_CM, TRACKING_DISTANCE_CM,
-    MIN_TRACKING_ALTITUDE_CM,
-    RC_LOOP_INTERVAL_S, TARGET_ALTITUDE_CM, UD_MAX_VELOCITY_CM_S, YAW_MAX_VELOCITY_CM_S,
-    YOLO_FRAME_STRIDE, YOLO_CONFIDENCE_MIN, YOLO_PERSON_CLASS_ID,
-    NOSE_KEYPOINT_INDEX, NOSE_CONFIDENCE_THRESHOLD,
+    INTERCEPT_DISTANCE_CM,
+    MANUAL_FB_VELOCITY_CM_S, MANUAL_LR_VELOCITY_CM_S,
+    MANUAL_UD_VELOCITY_CM_S, MANUAL_YAW_VELOCITY_DEG_S,
+    MAX_TRACKING_ALTITUDE_CM, MIN_TRACKING_ALTITUDE_CM,
+    RC_LOOP_INTERVAL_S, TARGET_ALTITUDE_CM, UD_MAX_VELOCITY_CM_S, WALL_BACKOFF_VELOCITY_CM_S, YAW_MAX_VELOCITY_CM_S,
+    YOLO_FRAME_STRIDE,
 )
 
 
+# ---- Windows keyboard input (manual mode) ----
+# GetAsyncKeyState polled each frame for hold-to-move (release = stop).
+# PeekMessage drain stops cv2 freeze when key held (OS WM_KEYDOWN flood).
+_user32 = ctypes.windll.user32
+_VK_W, _VK_S, _VK_A, _VK_D, _VK_Q, _VK_E = 0x57, 0x53, 0x41, 0x44, 0x51, 0x45
+_VK_UP, _VK_DOWN = 0x26, 0x28
+_VK_SPACE, _VK_M, _VK_ESC = 0x20, 0x4D, 0x1B
+
+
+def _is_key_pressed(vk: int) -> bool:
+    """True when key currently held (Windows VK code)."""
+    return _user32.GetAsyncKeyState(vk) & 0x8000 != 0
+
+class _MSG(ctypes.Structure):
+    _fields_ = [
+        ("hwnd",    ctypes.wintypes.HWND),
+        ("message", ctypes.wintypes.UINT),
+        ("wParam",  ctypes.wintypes.WPARAM),
+        ("lParam",  ctypes.wintypes.LPARAM),
+        ("time",    ctypes.wintypes.DWORD),
+        ("pt_x",    ctypes.wintypes.LONG),
+        ("pt_y",    ctypes.wintypes.LONG),
+    ]
+
+
+_PM_REMOVE = 0x0001
+_WM_KEYFIRST, _WM_KEYLAST = 0x0100, 0x0109
+
+
+def _drain_keyboard_messages() -> None:
+    """Flush WM_KEY* from this thread's queue so cv2 render pump keeps up under held keys."""
+    msg = _MSG()
+    while _user32.PeekMessageW(ctypes.byref(msg), 0, _WM_KEYFIRST, _WM_KEYLAST, _PM_REMOVE):
+        pass
+
+
 from .hud_overlay import (
+    draw_control_mode_badge,
     draw_detection_state,
     draw_target_y_line,
     draw_frame_crosshair,
@@ -97,6 +136,23 @@ class TelloInterceptor:
         self._target_smoothed_y_px: float = 0.0
         self._target_ema_initialized: bool = False
 
+        # Manual keyboard control
+        self.is_manual: bool = False
+        self.manual_lr: int = 0
+        self.manual_fb: int = 0
+        self.manual_ud: int = 0
+        self.manual_yaw: int = 0
+        self._space_was_pressed: bool = False
+        self._m_was_pressed: bool = False
+        self._esc_was_pressed: bool = False
+
+        self._space_rising_edge: bool = False
+        self._m_rising_edge: bool = False
+        self._esc_rising_edge: bool = False
+
+        self._is_airborne: bool = False
+        self._is_toggling_flight: bool = False
+
 
     def start(self):
 
@@ -123,10 +179,8 @@ class TelloInterceptor:
         if self.phantom_mode:
             print("[INFO] PHANTOM mode — skip takeoff. Logic only.")
         else:
-            print("[INFO] Taking off...")
-            with self._sdk_lock:
-                self.tello.takeoff()
-            print("[INFO] Airborne.")
+            print("[INFO] Ready. Press SPACE to take off.")
+            self._is_airborne = False
 
         self._log_start_time = time.time()
 
@@ -167,7 +221,7 @@ class TelloInterceptor:
         except Exception as e:
             print(f"[WARN] pitch log save failed: {e}")
 
-        if not self.phantom_mode:
+        if not self.phantom_mode and self._is_airborne:
             try:
                 with self._sdk_lock:
                     self.tello.land()
@@ -302,6 +356,10 @@ class TelloInterceptor:
             draw_telemetry_strip(current_frame, self)
             if self.phantom_mode:
                 draw_phantom_badge(current_frame)
+            draw_control_mode_badge(
+                current_frame, self.is_manual,
+                self.manual_lr, self.manual_fb, self.manual_ud, self.manual_yaw,
+            )
 
             tracking_target = tracking_target and target_y_px is not None and target_x_px is not None
 
@@ -320,6 +378,9 @@ class TelloInterceptor:
             # default pitch logging fields (filled per branch)
             pitch_source = "none"
             distance_proxy_value = -1.0
+
+            # lr currently unused by auto PIDs (Phase 7+); init 0 so manual mode + rc[0] write are safe.
+            lr = 0
 
             # target visible
             if tracking_target:
@@ -355,7 +416,7 @@ class TelloInterceptor:
                 # + altitude PIDs realign so ToF can reacquire.
                 if valid_front_tof:
                     pitch_source = "tof"
-                    error_pitch = TRACKING_DISTANCE_CM - self.front_tof_cm
+                    error_pitch = INTERCEPT_DISTANCE_CM - self.front_tof_cm
                     fb = self.pitch_pid.compute(error_pitch, RC_LOOP_INTERVAL_S)
                     self.pitch_bbox_pid.reset_integral()
                 elif tracked_person is not None and TARGET.is_visible(tracked_person):
@@ -432,23 +493,47 @@ class TelloInterceptor:
 
 
 
-            # Altitude Safety 
-            min_safe_altitude = MIN_TRACKING_ALTITUDE_CM if mode_label == "intercepting" else GEOFENCE_MIN_ALTITUDE_CM
+            # Manual keyboard override — replaces PID output before safety clamp.
+            # Safety blocks below still apply on top, keyboard cannot bypass them.
+            if self.is_manual:
+                mode_label = "manual"
+                lr = self.manual_lr
+                fb = self.manual_fb
+                ud = self.manual_ud
+                yaw = self.manual_yaw
 
-            if self.height_cm >= GEOFENCE_MAX_ALTITUDE_CM and ud > 0:
+            # Altitude Safety, dead-reckoning XY dropped (unreliable on Tello)
+            if self.height_cm >= MAX_TRACKING_ALTITUDE_CM and ud > 0:
                 ud = 0  # Block climbing above ceiling
-            elif 0 < self.height_cm <= min_safe_altitude and ud < 0:
+            elif 0 < self.height_cm <= MIN_TRACKING_ALTITUDE_CM and ud < 0:
                 ud = 0  # Block descending below floor
 
             # Forward Back Safety
-            min_safe_front_distance = INTERCEPT_DISTANCE_CM if mode_label == "intercepting" else FRONT_TOF_WALL_STOP_CM
-            if valid_front_tof and self.front_tof_cm <= min_safe_front_distance and fb > 0:
-                #fb = 0  # Block moving forward if close to a wall
-                fb = -5 # back movement
+            if valid_front_tof:
+                if self.front_tof_cm <= FRONT_TOF_WALL_STOP_CM and fb > 0:
+                    fb = 0
+                    self.pitch_pid.reset_integral()
+                    self.pitch_bbox_pid.reset_integral()
+                if mode_label == "searching":
+                    if self.front_tof_cm <= FRONT_TOF_WALL_BACKOFF_CM:
+                        fb = WALL_BACKOFF_VELOCITY_CM_S
+                        self.pitch_pid.reset_integral()
+                        self.pitch_bbox_pid.reset_integral()
+                    if self.front_tof_cm > FRONT_TOF_WALL_BACKOFF_CM and fb < 0:
+                        fb = 0
+                        self.pitch_pid.reset_integral()
+                        self.pitch_bbox_pid.reset_integral()
 
+
+
+            self.rc[0] = int(round(lr))
             self.rc[1] = int(round(fb))
             self.rc[2] = int(round(ud))
             self.rc[3] = int(round(yaw))
+
+            # for debug
+            #print(self.rc[1], self.front_tof_cm)
+            
 
             self._altitude_log.append((
                 time.time() - self._log_start_time,
@@ -476,15 +561,96 @@ class TelloInterceptor:
 
            
             cv2.imshow("TelloInterceptor", current_frame)
-            if cv2.waitKey(1) & 0xFF == 27:  # ESC key (only when window has focus)
-                self.video_active = False  # exits loop; threads also see flag before stop().land()
+            # Pump cv2 render. _poll_keyboard() drains key messages so cv2
+            # doesn't freeze when a movement key is held.
+            cv2.waitKey(1)
+            self._poll_keyboard()
+
+            # ESC — exit always, regardless of mode
+            if self._esc_rising_edge:
+                self.video_active = False
                 break
             # Window-X also exits — useful when terminal has focus and ESC won't fire
             if cv2.getWindowProperty("TelloInterceptor", cv2.WND_PROP_VISIBLE) < 1:
                 self.video_active = False
                 break
 
+            # SPACE — takeoff / land toggle. Threaded + _sdk_lock to avoid SDK socket clash.
+            # Clears djitellopy's response queue first — stale "unknown command: keepalive" or
+            # "tof N" responses from prior commands pollute the queue and get popped instead
+            # of the real takeoff/land "ok" response, causing djitellopy's 4-retry fail.
+            if self._space_rising_edge and not self.phantom_mode:
+                if not self._is_toggling_flight:
+                    self._is_toggling_flight = True
+                    def _toggle_flight():
+                        try:
+                            with self._sdk_lock:
+                                self.tello.get_own_udp_object()['responses'].clear()
+                                if self._is_airborne:
+                                    self.tello.land()
+                                    self._is_airborne = False
+                                else:
+                                    # Re-init SDK mode in case the drone rebooted or timed out of SDK mode. 
+                                    # Without this, takeoff is ignored and blocks the SDK thread causing a crash on exit.
+                                    try:
+                                        self.tello.send_control_command("command", timeout=1)
+                                    except Exception:
+                                        pass # Ignore timeout, standard djitellopy connect() already does this
+                                    self.tello.takeoff()
+                                    self._is_airborne = True
+                        except TelloException as e:
+                            print(f"[WARN] takeoff/land failed: {e}")
+                        finally:
+                            self._is_toggling_flight = False
+                    threading.Thread(target=_toggle_flight, daemon=True).start()
+
+            # M — toggle manual mode + reset all PIDs to avoid I-term pop on switch
+            if self._m_rising_edge:
+                self.is_manual = not self.is_manual
+                self.manual_lr = self.manual_fb = self.manual_ud = self.manual_yaw = 0
+                self.altitude_pid.reset_integral()
+                self.altitude_target_pid.reset_integral()
+                self.yaw_pid.reset_integral()
+                self.pitch_pid.reset_integral()
+                self.pitch_bbox_pid.reset_integral()
+
         cv2.destroyAllWindows()
+
+    def _poll_keyboard(self) -> None:
+        _drain_keyboard_messages()
+
+        space_now = _is_key_pressed(_VK_SPACE)
+        m_now     = _is_key_pressed(_VK_M)
+        esc_now   = _is_key_pressed(_VK_ESC)
+
+        self._space_rising_edge = space_now and not self._space_was_pressed
+        self._m_rising_edge     = m_now     and not self._m_was_pressed
+        self._esc_rising_edge   = esc_now   and not self._esc_was_pressed
+
+        self._space_was_pressed = space_now
+        self._m_was_pressed     = m_now
+        self._esc_was_pressed   = esc_now
+
+        if not self.is_manual:
+            self.manual_lr = self.manual_fb = self.manual_ud = self.manual_yaw = 0
+            return
+
+        self.manual_fb = (
+             MANUAL_FB_VELOCITY_CM_S  if _is_key_pressed(_VK_W) else
+            -MANUAL_FB_VELOCITY_CM_S  if _is_key_pressed(_VK_S) else 0
+        )
+        self.manual_lr = (
+            -MANUAL_LR_VELOCITY_CM_S  if _is_key_pressed(_VK_A) else
+             MANUAL_LR_VELOCITY_CM_S  if _is_key_pressed(_VK_D) else 0
+        )
+        self.manual_yaw = (
+            -MANUAL_YAW_VELOCITY_DEG_S if _is_key_pressed(_VK_Q) else
+             MANUAL_YAW_VELOCITY_DEG_S if _is_key_pressed(_VK_E) else 0
+        )
+        self.manual_ud = (
+             MANUAL_UD_VELOCITY_CM_S  if _is_key_pressed(_VK_UP)   else
+            -MANUAL_UD_VELOCITY_CM_S  if _is_key_pressed(_VK_DOWN) else 0
+        )
 
     def _update_front_tof(self):
         """Background thread: read front ToF + down ToF as fast as possible."""

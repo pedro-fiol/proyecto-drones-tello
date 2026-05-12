@@ -30,6 +30,8 @@ COLOR_CROSSHAIR = (0, 0, 255)
 COLOR_STATE_TEXT = (0, 255, 255)
 COLOR_TELEMETRY_PRIMARY = (0, 200, 255)
 COLOR_TELEMETRY_SECONDARY = (150, 150, 255)
+COLOR_MANUAL_BADGE = (0, 220, 255)    # yellow-ish
+COLOR_AUTO_BADGE = (180, 180, 180)    # grey
 
 def draw_person_overlays(
     frame: np.ndarray,
@@ -93,6 +95,30 @@ def draw_phantom_badge(frame: np.ndarray) -> None:
     h, w = frame.shape[:2]
     cv2.putText(frame, "PHANTOM", (w - 220, 50),
                 HUD_FONT, 1.0, COLOR_FACE_BOX, 3)
+
+
+def draw_control_mode_badge(
+    frame: np.ndarray,
+    manual_mode: bool,
+    manual_lr: int = 0,
+    manual_fb: int = 0,
+    manual_ud: int = 0,
+    manual_yaw: int = 0,
+) -> None:
+    """Top-right badge: AUTO (grey) or MANUAL (yellow) + active setpoints when manual."""
+    h, w = frame.shape[:2]
+    lh = HUD_LINE_HEIGHT_PIXELS
+
+    if manual_mode:
+        cv2.putText(frame, "MANUAL", (w - 195, lh * 4),
+                    HUD_FONT, 0.9, COLOR_MANUAL_BADGE, 2)
+        cv2.putText(frame, f"lr={manual_lr:+d} fb={manual_fb:+d}",
+                    (w - 230, lh * 5), HUD_FONT, 0.55, COLOR_MANUAL_BADGE, 1)
+        cv2.putText(frame, f"ud={manual_ud:+d} yaw={manual_yaw:+d}",
+                    (w - 230, lh * 6), HUD_FONT, 0.55, COLOR_MANUAL_BADGE, 1)
+    else:
+        cv2.putText(frame, "AUTO", (w - 130, lh * 4),
+                    HUD_FONT, 0.9, COLOR_AUTO_BADGE, 1)
 
 
 def draw_detection_state(

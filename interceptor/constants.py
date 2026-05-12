@@ -1,7 +1,6 @@
 """
 interceptor/constants.py
 All named constants for the Tello Interceptor project.
-No logic here — only numbers and strings with units in names.
 """
 
 # ---- Frame geometry ----
@@ -15,54 +14,37 @@ FRAME_CENTER_Y       = FRAME_HEIGHT_PIXELS // 2   # 360
 # alpha = new-sample weight. 0.3 = stronger smoothing (~5-frame time constant) to tame Kp=0.35.
 TARGET_EMA_ALPHA = 0.3
 
+
 # ---- YOLO / Detection ----
 YOLO_MODEL_PATH         = "yolov8s-pose.pt"
 YOLO_FRAME_STRIDE       = 1         # detection every N frames
 YOLO_PERSON_CLASS_ID    = 0
 YOLO_CONFIDENCE_MIN     = 0.8
-
 NOSE_KEYPOINT_INDEX = 0         # COCO keypoint index for nose
 NOSE_CONFIDENCE_THRESHOLD = 0.7  # min conf to consider face visible
 
-# ---- Altitude (cm) ----
-ALTITUDE_OFFSET_CM          = 0      
-TARGET_ALTITUDE_CM       = 150 - ALTITUDE_OFFSET_CM
-GEOFENCE_MAX_ALTITUDE_CM = 180 - ALTITUDE_OFFSET_CM
-GEOFENCE_MIN_ALTITUDE_CM = 30 
 
-# Floor for face PID — prevents descent into ground effect / propwash zone.
-# Face PID is allowed to climb but blocked from descending below this.
-MIN_TRACKING_ALTITUDE_CM = 50
-
-# Grace period after target loss — hover (ud=0) instead of switching to baro PID.
-# Stops target/baro PID fight when target flickers for 1-2 frames.
-TARGET_LOST_GRACE_S = 1.0
-
-# ud velocity cap (cm/s). Tello SDK accepts ±100, but at full ±100 the rotor response
-# is asymmetric → drone tilts → horizontal kick → wall crash. Cap at 40 keeps altitude
-# tracking responsive but eliminates pitch coupling.
-UD_MAX_VELOCITY_CM_S = 80
+# --- Velocity PID controller limits ---
+# max is 100
+UD_MAX_VELOCITY_CM_S = 60
 YAW_MAX_VELOCITY_CM_S = 50
 FB_MAX_VELOCITY_CM_S = 60
 
-# ---- Geofence (cm) ----
-GEOFENCE_HALF_X_CM             = 200
-GEOFENCE_HALF_Y_CM             = 200
-GEOFENCE_BACKOFF_VELOCITY_CM_S = 25
+# ---- Target tracking ----
+TARGET_ALTITUDE_CM       = 150
+MAX_TRACKING_ALTITUDE_CM = 180   # ceiling clamp 
+MIN_TRACKING_ALTITUDE_CM = 30   # floor clamp 
 
-# ---- Distance (cm) ----
-TRACKING_DISTANCE_CM        = 80
-INTERCEPT_DISTANCE_CM       = 80
+TARGET_LOST_GRACE_S = 1.0 # to avoid altitude PID flickering
+
+INTERCEPT_DISTANCE_CM       = 100
 FRONT_TOF_MAX_RANGE_CM      = 120
-FRONT_TOF_WALL_STOP_CM      = 60
-FRONT_TOF_WALL_BACKOFF_CM   = 30
-#WALL_BACKOFF_VELOCITY_CM_S  = 5
+FRONT_TOF_WALL_STOP_CM      = 40
+FRONT_TOF_WALL_BACKOFF_CM   = 20
+WALL_BACKOFF_VELOCITY_CM_S  = - FB_MAX_VELOCITY_CM_S  
 
-# ---- Room / search ----
-ROOM_MODE                       = "small"   # "small" | "big"
-SEARCH_SPIN_VELOCITY_DEG_S      = 30
-SEARCH_ADVANCE_STEP_CM          = 80
-SEARCH_MAX_ADVANCE_TOTAL_CM     = 300 # distancia total volada por el dron en una búsqueda
+
+
 
 
 # ---- PID gains (kp, ki, kd) ----
@@ -74,6 +56,13 @@ GAINS_FORWARD_BACK_TOF_PID = (-1.5, -0.02, -0.4)   # cm error → fb
 
 GAINS_FORWARD_BACK_BBOX_PID = (360.0, 0.00, 5.0)   # ratio err → fb (only when front ToF fails — Kp doubled, Kd cut: ratio signal too noisy for big Kd)
 GAINS_LEFT_RIGHT_PID        = (0.08, 0.00, 0.05)   # px error  → lr
+
+
+
+
+
+
+
 
 # ---- Failure tiers ----
 BATTERY_MEDIUM_PERCENT      = 20
@@ -88,6 +77,15 @@ RC_LOOP_INTERVAL_S          = 0.05   # 20 Hz
 
 # ---- Mission pad ----
 TAKEOFF_PAD_ID = 1   # pad placed at room center, used as XY origin
+
+
+# ---- Manual keyboard control (per-axis velocities) ----
+# Active only when manual_mode toggled via 'M' key. Safety clamps (wall stop,
+# altitude clamp) still apply on top — keyboard cannot override safety.
+MANUAL_FB_VELOCITY_CM_S    = 30
+MANUAL_LR_VELOCITY_CM_S    = 30
+MANUAL_UD_VELOCITY_CM_S    = 30
+MANUAL_YAW_VELOCITY_DEG_S  = 40
 
 # ---- Target tracking (Phase 6a) ----
 # Distance-proxy setpoints used by the pitch fallback PID when front ToF is invalid.
@@ -107,3 +105,6 @@ TAKEOFF_PAD_ID = 1   # pad placed at room center, used as XY origin
 # The active TARGET selection lives in interceptor/target.py to avoid circular imports.
 BBOX_HEIGHT_RATIO_SETPOINT     = 0.75
 SHOULDER_WIDTH_RATIO_SETPOINT  = 0.20
+
+
+
