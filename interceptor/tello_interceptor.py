@@ -136,6 +136,17 @@ class TelloInterceptor:
         self._target_smoothed_y_px: float = 0.0
         self._target_ema_initialized: bool = False
 
+        # EMA-smoothed closeness signal for bbox pitch PID. Same TARGET_EMA_ALPHA as
+        # target x/y — closeness is computed from raw detection, jitters per frame.
+        # Without smoothing, Kd term spikes on YOLO noise and produces twitchy fb.
+        self._closeness_smoothed: float = 0.0
+        self._closeness_ema_initialized: bool = False
+
+        # Tracks last pitch PID source ("tof"|"bbox"|"none") to detect source switches.
+        # On switch, the incoming PID's error_last is seeded with current error so the
+        # first D-term doesn't spike off a stale error from a different unit system.
+        self._pitch_source_last: str = "none"
+
         # Manual keyboard control
         self.is_manual: bool = False
         self.manual_lr: int = 0
@@ -179,8 +190,13 @@ class TelloInterceptor:
         if self.phantom_mode:
             print("[INFO] PHANTOM mode — skip takeoff. Logic only.")
         else:
-            print("[INFO] Ready. Press SPACE to take off.")
-            self._is_airborne = False
+            print("[INFO] Auto-takeoff disabled. Press SPACE to take off manually.")
+            # try:
+            #     self.tello.takeoff()
+            #     self._is_airborne = True
+            # except TelloException as e:
+            #     print(f"[ERROR] Auto-takeoff failed: {e}")
+            #     self._is_airborne = False
 
         self._log_start_time = time.time()
 
@@ -222,11 +238,15 @@ class TelloInterceptor:
             print(f"[WARN] pitch log save failed: {e}")
 
         if not self.phantom_mode and self._is_airborne:
+            print("[INFO] Initiating auto-landing on shutdown...")
             try:
                 with self._sdk_lock:
+                    if 'responses' in self.tello.get_own_udp_object():
+                        self.tello.get_own_udp_object()['responses'].clear()
                     self.tello.land()
-            except TelloException:
-                pass
+                    print("[INFO] Auto-landing complete.")
+            except TelloException as e:
+                print(f"[ERROR] Failed to land during shutdown: {e}")
 
         # Do not use "end()" from djitellopy, it closes SDK socket and causes errors for subsequent runs.
         time.sleep(0.6)
@@ -234,10 +254,6 @@ class TelloInterceptor:
             with self._sdk_lock:
                 self.tello.streamoff()
         except TelloException:
-            pass
-        try:
-            self.tello.end()
-        except Exception:
             pass
         finally:
             self._stop_finished = True
@@ -280,8 +296,8 @@ class TelloInterceptor:
         Columns:
             time_s              — seconds since takeoff
             front_tof_cm        — raw front ToF reading (-1 = invalid)
-            distance_proxy      — tracked person distance proxy from active TARGET (-1 = no person)
-            error               — PID error in active source units (cm for tof, proxy units for bbox)
+            closeness           — tracked person closeness signal from active TARGET (-1 = no person)
+            error               — PID error in active source units (cm for tof, closeness units for bbox)
             fb_command          — commanded fb velocity (cm/s) sent to RC
             source              — "tof" | "bbox" | "none"
         """
@@ -289,7 +305,7 @@ class TelloInterceptor:
             return
         self._save_csv_safe(
             "logs/pitch_response.csv",
-            ["time_s", "front_tof_cm", "distance_proxy", "error", "fb_command", "source"],
+            ["time_s", "front_tof_cm", "closeness", "error", "fb_command", "source"],
             self._pitch_log,
         )
 
@@ -319,11 +335,20 @@ class TelloInterceptor:
             current_frame = drone_video.frame
             if current_frame is None:
                 consecutive_none_frames += 1
-                # Exit if video stream is dead for 60+ consecutive frames (~2s @ 30 FPS)
-                if consecutive_none_frames > 60:
+                # Exit only after a long, sustained outage. H264 decoder hiccups can
+                # produce 1-3s bursts of None frames and self-recover; do not pull the
+                # plug (and land) on those. 300 ≈ 10s.
+                if consecutive_none_frames > 300:
                     print("[ERROR] Video stream dead — H.264 decoder stuck. Exiting.")
                     self.video_active = False
                     break
+                # Keep cv2 window pumping and ESC alive even when no frame is ready.
+                cv2.waitKey(1)
+                self._poll_keyboard()
+                if self._esc_rising_edge:
+                    self.video_active = False
+                    break
+                time.sleep(0.01)
                 continue
             consecutive_none_frames = 0  # Reset counter on successful frame
 
@@ -377,7 +402,7 @@ class TelloInterceptor:
 
             # default pitch logging fields (filled per branch)
             pitch_source = "none"
-            distance_proxy_value = -1.0
+            closeness_value = -1.0
 
             # lr currently unused by auto PIDs (Phase 7+); init 0 so manual mode + rc[0] write are safe.
             lr = 0
@@ -407,23 +432,45 @@ class TelloInterceptor:
                 error_yaw = self._target_smoothed_x_px - frame_center_x   # px (+ve = target right of center → CW)
                 yaw = self.yaw_pid.compute(error_yaw, RC_LOOP_INTERVAL_S)
 
-                # --- Pitch PID — ToF primary, per-target distance-proxy fallback ---
-                # Bbox fallback is advance-only: gated on proxy < setpoint so it never
-                # commands a backup. When ToF is invalid AND the target proxy already
-                # exceeds the setpoint (drone reached or passed the desired distance),
-                # the cause is usually cone misalignment, not "drone too close" —
-                # backing up blind would lose the target. Hover instead and let yaw
-                # + altitude PIDs realign so ToF can reacquire.
+                # --- Pitch PID ---
+
+                # ToF PID
                 if valid_front_tof:
                     pitch_source = "tof"
                     error_pitch = INTERCEPT_DISTANCE_CM - self.front_tof_cm
+
+                    # Switching INTO ToF: seed error_last to current err so D-term
+                    # doesn't spike off whatever was last in pitch_pid (possibly stale).
+                    if self._pitch_source_last != "tof":
+                        self.pitch_pid.error_last = error_pitch
+
                     fb = self.pitch_pid.compute(error_pitch, RC_LOOP_INTERVAL_S)
                     self.pitch_bbox_pid.reset_integral()
+
+
+                    # Invalidate closeness EMA so next bbox switch re-inits cleanly
+                    # rather than blending fresh detection with frozen stale value.
+                    self._closeness_ema_initialized = False
+
                 elif tracked_person is not None and TARGET.is_visible(tracked_person):
-                    distance_proxy_value = TARGET.distance_proxy(tracked_person)
-                    if distance_proxy_value < TARGET.distance_setpoint:
+                    raw_closeness = TARGET.closeness(tracked_person)
+
+                    # EMA-smooth closeness before PID. Same TARGET_EMA_ALPHA as target x/y EMA.
+                    if not self._closeness_ema_initialized:
+                        self._closeness_smoothed = float(raw_closeness)
+                        self._closeness_ema_initialized = True
+                    else:
+                        self._closeness_smoothed = (TARGET_EMA_ALPHA * raw_closeness +
+                                                    (1.0 - TARGET_EMA_ALPHA) * self._closeness_smoothed)
+                    closeness_value = self._closeness_smoothed
+                    
+                    if closeness_value < TARGET.closeness_setpoint:
                         pitch_source = "bbox"
-                        error_pitch = TARGET.distance_setpoint - distance_proxy_value
+                        error_pitch = TARGET.closeness_setpoint - closeness_value
+                        # Switching INTO bbox: seed error_last (ratio units) to avoid
+                        # D-spike off a stale ToF-unit error from previous bbox use.
+                        if self._pitch_source_last != "bbox":
+                            self.pitch_bbox_pid.error_last = error_pitch
                         fb = self.pitch_bbox_pid.compute(error_pitch, RC_LOOP_INTERVAL_S)
                         self.pitch_pid.reset_integral()
                     else:
@@ -461,8 +508,9 @@ class TelloInterceptor:
                 self.pitch_pid.reset_integral()
                 self.pitch_bbox_pid.reset_integral()
 
-                # EMA
-                self._target_ema_initialized = False  # next target = fresh EMA start
+                # EMA — next target = fresh start for both position + closeness
+                self._target_ema_initialized = False
+                self._closeness_ema_initialized = False
 
             # target not visible and not in grace -> searching mode
             else:
@@ -472,6 +520,7 @@ class TelloInterceptor:
                 # altitude PID — baro
                 self.altitude_target_pid.reset_integral()
                 self._target_ema_initialized = False
+                self._closeness_ema_initialized = False
                 ud = self.altitude_pid.compute(error_altitude, RC_LOOP_INTERVAL_S)
 
                 # yaw
@@ -519,7 +568,7 @@ class TelloInterceptor:
                         fb = WALL_BACKOFF_VELOCITY_CM_S
                         self.pitch_pid.reset_integral()
                         self.pitch_bbox_pid.reset_integral()
-                    if self.front_tof_cm > FRONT_TOF_WALL_BACKOFF_CM and fb < 0:
+                    if FRONT_TOF_WALL_BACKOFF_CM < self.front_tof_cm and fb < 0:
                         fb = 0
                         self.pitch_pid.reset_integral()
                         self.pitch_bbox_pid.reset_integral()
@@ -553,11 +602,14 @@ class TelloInterceptor:
             self._pitch_log.append((
                 time.time() - self._log_start_time,
                 self.front_tof_cm,
-                distance_proxy_value,
+                closeness_value,
                 error_pitch,
                 fb,
                 pitch_source,
             ))
+
+            # Latch pitch source for next-frame transition detection (D-term seeding).
+            self._pitch_source_last = pitch_source
 
            
             cv2.imshow("TelloInterceptor", current_frame)
@@ -584,21 +636,28 @@ class TelloInterceptor:
                     self._is_toggling_flight = True
                     def _toggle_flight():
                         try:
+                            # Re-init SDK mode in case the drone rebooted or timed out of SDK mode. 
+                            # Do this outside the main lock so we don't hold up other threads on timeout.
+                            try:
+                                self.tello.send_control_command("command", timeout=1)
+                            except Exception:
+                                pass # Ignore timeout, standard djitellopy connect() already does this
+                                
                             with self._sdk_lock:
-                                self.tello.get_own_udp_object()['responses'].clear()
+                                # Ensure we don't accidentally pop earlier unrelated responses
+                                if 'responses' in self.tello.get_own_udp_object():
+                                    self.tello.get_own_udp_object()['responses'].clear()
+                                
                                 if self._is_airborne:
                                     self.tello.land()
                                     self._is_airborne = False
                                 else:
-                                    # Re-init SDK mode in case the drone rebooted or timed out of SDK mode. 
-                                    # Without this, takeoff is ignored and blocks the SDK thread causing a crash on exit.
-                                    try:
-                                        self.tello.send_control_command("command", timeout=1)
-                                    except Exception:
-                                        pass # Ignore timeout, standard djitellopy connect() already does this
                                     self.tello.takeoff()
                                     self._is_airborne = True
                         except TelloException as e:
+                            # Do NOT touch _is_airborne here. The successful-path assignment
+                            # only runs if the SDK call returned. If it raised, the flag is
+                            # already correct (still pre-call value).
                             print(f"[WARN] takeoff/land failed: {e}")
                         finally:
                             self._is_toggling_flight = False
@@ -653,32 +712,31 @@ class TelloInterceptor:
         )
 
     def _update_front_tof(self):
-        """Background thread: read front ToF + down ToF as fast as possible."""
+        """Background thread: read front ToF + down ToF at ~5 Hz.
+
+        Sleep matters: spamming `EXT tof?` holds _sdk_lock for ~100ms per call with
+        no gap, starves the RC thread, and stresses WiFi → H264 decoder errors
+        (`error while decoding MB ...`) → dead frames → auto-land.
+        """
         while self.front_tof_active:
             try:
-
-                # frontward ToF
+                # frontward ToF — single short critical section, then release lock
                 with self._sdk_lock:
                     raw = self.tello.send_command_with_return("EXT tof?", timeout=1)
                 if raw and raw.strip().startswith("tof "):
                     mm = int(raw.strip().split()[1])
                     self.front_tof_cm = -1.0 if mm >= 8190 else mm / 10.0
 
-                # downward ToF
+                # downward ToF + baro — read from state listener (no SDK command, no lock)
                 state = self.tello.get_current_state()
                 if state:
                     self.down_tof_cm = state.get("tof", -1)
-                
-                # ToF or barometer height?
-                baro_height_cm = state.get("h", -1) if state else -1
-
-                if self.down_tof_cm > baro_height_cm: 
-                    self.height_cm = self.down_tof_cm
-                else:
-                    self.height_cm = baro_height_cm
+                    # Baro is primary altitude per CLAUDE.md. Down ToF is obstacle-warning only.
+                    self.height_cm = state.get("h", -1)
 
             except Exception:
                 pass
+            time.sleep(0.2)  # 5 Hz — enough for wall avoidance, frees SDK + WiFi
 
     def _update_telemetry(self):
         while self.telemetry_active:

@@ -28,7 +28,12 @@ NOSE_CONFIDENCE_THRESHOLD = 0.7  # min conf to consider face visible
 # max is 100
 UD_MAX_VELOCITY_CM_S = 60
 YAW_MAX_VELOCITY_CM_S = 50
-FB_MAX_VELOCITY_CM_S = 60
+FB_MAX_VELOCITY_CM_S = 100
+
+MANUAL_FB_VELOCITY_CM_S    = 60
+MANUAL_LR_VELOCITY_CM_S    = 60
+MANUAL_UD_VELOCITY_CM_S    = 60
+MANUAL_YAW_VELOCITY_DEG_S  = 60
 
 # ---- Target tracking ----
 TARGET_ALTITUDE_CM       = 150
@@ -37,7 +42,7 @@ MIN_TRACKING_ALTITUDE_CM = 30   # floor clamp
 
 TARGET_LOST_GRACE_S = 1.0 # to avoid altitude PID flickering
 
-INTERCEPT_DISTANCE_CM       = 100
+INTERCEPT_DISTANCE_CM       = 90
 FRONT_TOF_MAX_RANGE_CM      = 120
 FRONT_TOF_WALL_STOP_CM      = 40
 FRONT_TOF_WALL_BACKOFF_CM   = 20
@@ -50,26 +55,22 @@ WALL_BACKOFF_VELOCITY_CM_S  = - FB_MAX_VELOCITY_CM_S
 # ---- PID gains (kp, ki, kd) ----
 GAINS_ALTITUDE_PID          = (1.4, 0.04, 0.08)         # cm error  → ud  (baro mode)
 GAINS_ALTITUDE_TARGET_PID   = (-0.15, -0.004, -0.08)    # px error  → ud  (image-y inverted vs world-up)
-GAINS_YAW_PID               = (0.25, 0.001, 0.05)       # px error  → yaw
+GAINS_YAW_PID               = (0.25, 0.003, 0.05)       # px error  → yaw
 
-GAINS_FORWARD_BACK_TOF_PID = (-1.5, -0.02, -0.4)   # cm error → fb
+GAINS_FORWARD_BACK_TOF_PID = (-0.85, -0.02, -0.42)   # cm error → fb
 
-GAINS_FORWARD_BACK_BBOX_PID = (360.0, 0.00, 5.0)   # ratio err → fb (only when front ToF fails — Kp doubled, Kd cut: ratio signal too noisy for big Kd)
-GAINS_LEFT_RIGHT_PID        = (0.08, 0.00, 0.05)   # px error  → lr
+GAINS_FORWARD_BACK_BBOX_PID = (400, 0.0, 30.0)   # ratio err → fb
 
-
-
-
-
+GAINS_LEFT_RIGHT_PID        = (0.08, 0.00, 0.00)   # px error  → lr
 
 
 
 # ---- Failure tiers ----
-BATTERY_MEDIUM_PERCENT      = 20
-BATTERY_HARD_PERCENT        = 10
-CONNECTION_DROP_MEDIUM_S    = 2
+BATTERY_MEDIUM_PERCENT      = 6
+BATTERY_HARD_PERCENT        = 5
+CONNECTION_DROP_MEDIUM_S    = 5
 CONNECTION_DROP_HARD_S      = 5
-TOF_STUCK_MEDIUM_S          = 3
+TOF_STUCK_MEDIUM_S          = 5
 ERROR_HOVER_TIMEOUT_S       = 5
 
 # ---- RC loop ----
@@ -79,32 +80,26 @@ RC_LOOP_INTERVAL_S          = 0.05   # 20 Hz
 TAKEOFF_PAD_ID = 1   # pad placed at room center, used as XY origin
 
 
-# ---- Manual keyboard control (per-axis velocities) ----
-# Active only when manual_mode toggled via 'M' key. Safety clamps (wall stop,
-# altitude clamp) still apply on top — keyboard cannot override safety.
-MANUAL_FB_VELOCITY_CM_S    = 30
-MANUAL_LR_VELOCITY_CM_S    = 30
-MANUAL_UD_VELOCITY_CM_S    = 30
-MANUAL_YAW_VELOCITY_DEG_S  = 40
-
 # ---- Target tracking (Phase 6a) ----
-# Distance-proxy setpoints used by the pitch fallback PID when front ToF is invalid.
-# Each Target picks one of these via target.distance_setpoint. Higher proxy value =
-# closer person. Drone advances under the bbox PID until the proxy reaches setpoint.
+# Closeness setpoints used by the pitch fallback PID when front ToF is invalid.
+# Each Target picks one of these via target.closeness_setpoint. Higher closeness =
+# closer person. Drone advances under the bbox PID until closeness reaches setpoint.
 #
 # BBOX_HEIGHT_RATIO_SETPOINT — for nose/eyes/bbox targets that frame the full body.
 #   0.75 ≈ bbox fills 75% of frame height ≈ ~50cm distance. Pushes the drone INTO
 #   the ToF acquisition range when ToF is blind (cone misalignment).
 #
-# SHOULDER_WIDTH_RATIO_SETPOINT — for SHOULDERS_MIDPOINT_TARGET. Bbox height is
-#   useless when drone hovers chest-high (full body always fills frame). Use the
-#   pixel distance between shoulder keypoints divided by frame width instead —
-#   it scales meaningfully with distance regardless of framing.
-#   0.20 ≈ shoulders ~190px apart on a 960px frame ≈ ~80cm distance.
+# BBOX_WIDTH_RATIO_SETPOINT — for SHOULDERS_MIDPOINT_TARGET. Person bbox width normalized
+#   by frame width. More reliable than shoulder keypoint spread (works even if one
+#   shoulder keypoint is low-confidence). Starts at 0.35 — tune by walking to known
+#   distance (e.g. 80cm from drone) and reading closeness from HUD/log.
+#
+# SHOULDER_WIDTH_RATIO_SETPOINT — kept for reference / fallback.
 #
 # The active TARGET selection lives in interceptor/target.py to avoid circular imports.
 BBOX_HEIGHT_RATIO_SETPOINT     = 0.75
-SHOULDER_WIDTH_RATIO_SETPOINT  = 0.20
+BBOX_WIDTH_RATIO_SETPOINT      = 0.35
+SHOULDER_WIDTH_RATIO_SETPOINT  = 0.5
 
 
 

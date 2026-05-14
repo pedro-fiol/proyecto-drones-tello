@@ -4,14 +4,14 @@
 # (which imports av) loads its decoder thread.
 import av.logging
 av.logging.set_level(av.logging.PANIC)
-
 from interceptor.tello_interceptor import TelloInterceptor
+import traceback
 
 # powershell -ExecutionPolicy Bypass -File switch-tello.ps1 tello
 # powershell -ExecutionPolicy Bypass -File switch-tello.ps1 dual
 # powershell -ExecutionPolicy Bypass -File switch-tello.ps1 lan
 
-import traceback
+
 
 # PHANTOM = True → drone never takes off, all logic dry-runs in HUD. Use for testing PID + YOLO.
 PHANTOM = False

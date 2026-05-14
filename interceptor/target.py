@@ -17,6 +17,7 @@ from typing import Callable, Optional
 from interceptor.perception import Person, KEYPOINT_VISIBILITY_THRESHOLD
 from interceptor.constants import (
     BBOX_HEIGHT_RATIO_SETPOINT,
+    BBOX_WIDTH_RATIO_SETPOINT,
     FRAME_HEIGHT_PIXELS,
     FRAME_WIDTH_PIXELS,
     NOSE_CONFIDENCE_THRESHOLD,
@@ -37,21 +38,21 @@ class Target:
             keypoints/confidences pass the gate for tracking mode.
         point: extractor on a Person returning (x_px, y_px). Caller MUST guard
             with is_visible(person) first; behavior is undefined otherwise.
-        distance_proxy: closeness signal in [0, 1]. Bigger = closer to camera.
+        closeness: closeness signal in [0, 1]. Bigger = closer to camera.
             Used by the pitch fallback PID when front ToF is invalid. Each target
-            picks the most informative proxy for its framing (bbox height for
-            face/body targets, shoulder pixel width for chest-height tracking).
+            picks the most informative signal for its framing (bbox height for
+            face/body targets, bbox width for chest-height tracking).
             Caller MUST guard with is_visible(person) first.
-        distance_setpoint: target value of distance_proxy. Pitch PID drives the
-            drone forward until proxy reaches this setpoint.
+        closeness_setpoint: target value of closeness. Pitch PID drives the drone
+            forward until closeness reaches this setpoint.
     """
 
     name: str
     target_y_ratio: float
     is_visible: Callable[[Person], bool]
     point: Callable[[Person], tuple[int, int]]
-    distance_proxy: Callable[[Person], float]
-    distance_setpoint: float
+    closeness: Callable[[Person], float]
+    closeness_setpoint: float
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +73,6 @@ def _both_eyes_visible(person: Person) -> bool:
         and person.right_eye.confidence >= KEYPOINT_VISIBILITY_THRESHOLD
     )
 
-
 def _both_shoulders_visible(person: Person) -> bool:
     """Both shoulder keypoints above KEYPOINT_VISIBILITY_THRESHOLD."""
     if person.left_shoulder is None or person.right_shoulder is None:
@@ -81,7 +81,6 @@ def _both_shoulders_visible(person: Person) -> bool:
         person.left_shoulder.confidence >= KEYPOINT_VISIBILITY_THRESHOLD
         and person.right_shoulder.confidence >= KEYPOINT_VISIBILITY_THRESHOLD
     )
-
 
 def _bbox_visible(person: Person) -> bool:
     """Bbox confidence at or above YOLO detector threshold (always true for detector output)."""
@@ -113,7 +112,7 @@ def _bbox_center(person: Person) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
-# Distance proxies (closeness signals for pitch fallback PID)
+# Closeness signals for pitch fallback PID (0..1, bigger = closer)
 # ---------------------------------------------------------------------------
 
 def _bbox_height_ratio(person: Person) -> float:
@@ -131,6 +130,16 @@ def _shoulder_width_ratio(person: Person) -> float:
     return abs(person.left_shoulder.x - person.right_shoulder.x) / FRAME_WIDTH_PIXELS
 
 
+def _bbox_width_ratio(person: Person) -> float:
+    """Person bbox width divided by frame width. Bigger = closer.
+
+    More reliable than shoulder keypoint spread: available whenever a bbox exists,
+    no keypoint confidence requirement, and naturally represents person silhouette
+    width regardless of shoulder visibility.
+    """
+    return person.bbox_width_pixels / FRAME_WIDTH_PIXELS
+
+
 # ---------------------------------------------------------------------------
 # Built-in Target instances
 # ---------------------------------------------------------------------------
@@ -142,20 +151,20 @@ NOSE_TARGET = Target(
     target_y_ratio=0.2,
     is_visible=_nose_visible,
     point=_nose_point,
-    distance_proxy=_bbox_height_ratio,
-    distance_setpoint=BBOX_HEIGHT_RATIO_SETPOINT,
+    closeness=_bbox_height_ratio,
+    closeness_setpoint=BBOX_HEIGHT_RATIO_SETPOINT,
 )
 
 # Default for Phase 6a: drone hovers chest-height so front ToF cone hits torso.
-# Uses shoulder pixel width as distance proxy because bbox height saturates when
-# the drone hovers within the body (full body fills frame regardless of distance).
+# Uses bbox width as closeness signal — more reliable than shoulder keypoint spread
+# (available whenever bbox exists, no keypoint confidence gate, same scaling).
 SHOULDERS_MIDPOINT_TARGET = Target(
     name="shoulders_midpoint",
     target_y_ratio=0.25,
     is_visible=_both_shoulders_visible,
     point=_shoulders_midpoint,
-    distance_proxy=_shoulder_width_ratio,
-    distance_setpoint=SHOULDER_WIDTH_RATIO_SETPOINT,
+    closeness=_bbox_width_ratio,
+    closeness_setpoint=BBOX_WIDTH_RATIO_SETPOINT,
 )
 
 # Same framing as nose (face-height) but more robust when nose keypoint
@@ -165,8 +174,8 @@ EYES_MIDPOINT_TARGET = Target(
     target_y_ratio=0.2,
     is_visible=_both_eyes_visible,
     point=_eyes_midpoint,
-    distance_proxy=_bbox_height_ratio,
-    distance_setpoint=BBOX_HEIGHT_RATIO_SETPOINT,
+    closeness=_bbox_height_ratio,
+    closeness_setpoint=BBOX_HEIGHT_RATIO_SETPOINT,
 )
 
 # Coarse fallback — works even when person is turned away (no face/keypoints).
@@ -175,8 +184,8 @@ BBOX_CENTER_TARGET = Target(
     target_y_ratio=0.5,
     is_visible=_bbox_visible,
     point=_bbox_center,
-    distance_proxy=_bbox_height_ratio,
-    distance_setpoint=BBOX_HEIGHT_RATIO_SETPOINT,
+    closeness=_bbox_height_ratio,
+    closeness_setpoint=BBOX_HEIGHT_RATIO_SETPOINT,
 )
 
 

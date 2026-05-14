@@ -46,7 +46,7 @@ def draw_person_overlays(
             person, or (None, None) when no person passes target.is_visible.
         tracking — True when at least one person passed target.is_visible.
         tracked_person — the Person whose target is active (for tracking),
-            or the first body bbox as fallback (for bbox-PID distance proxy),
+            or the first body bbox as fallback (for bbox-PID closeness signal),
             or None if no persons at all.
 
     Visible-target persons take priority over body-only ones for `tracked_person`.
