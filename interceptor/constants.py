@@ -29,6 +29,7 @@ NOSE_CONFIDENCE_THRESHOLD = 0.7  # min conf to consider face visible
 UD_MAX_VELOCITY_CM_S = 60
 YAW_MAX_VELOCITY_CM_S = 50
 FB_MAX_VELOCITY_CM_S = 100
+LR_MAX_VELOCITY_CM_S = 60
 
 MANUAL_FB_VELOCITY_CM_S    = 60
 MANUAL_LR_VELOCITY_CM_S    = 60
@@ -49,25 +50,43 @@ FRONT_TOF_WALL_BACKOFF_CM   = 20
 WALL_BACKOFF_VELOCITY_CM_S  = - FB_MAX_VELOCITY_CM_S  
 
 
+# --- Search algorithm ---
+# Tello has no reliable XY odometry → no dead-reckoning. Advance ends via pitch_pid
+# settling on INTERCEPT_DISTANCE_CM. Budget tracked in cycles, not cm.
+SEARCH_SPIN_VELOCITY_DEG_S    = 100
+SEARCH_YAW_TOLERANCE_DEG      = 5
+SEARCH_SAMPLE_EVERY_DEG       = 10       # min yaw delta between direction samples during spin
+SEARCH_MAX_CYCLES             = 3        # spin+advance cycles before hover_done
+SEARCH_ADVANCE_TOLERANCE_CM   = 15       # advance done when |INTERCEPT_DISTANCE_CM - front_tof_cm| < this
+SEARCH_ADVANCE_TIMEOUT_S      = 8.0      # bail if PID never settles (open space, ToF dropouts)
+SEARCH_OPEN_SPACE_VELOCITY_CM_S = 30     # fb when ToF out-of-range during advance (no obstacle yet → push forward until ToF acquires)
 
+# Grace-period yaw recovery: when target lost off-edge, yaw toward last-seen side
+GRACE_RECOVERY_YAW_DEG_S      = 60       # yaw rate during grace toward last-seen side
+GRACE_RECOVERY_MIN_OFFSET_PX  = 100      # only trigger if target was that far off-center when lost
 
 
 # ---- PID gains (kp, ki, kd) ----
+
 GAINS_ALTITUDE_PID          = (1.4, 0.04, 0.08)         # cm error  → ud  (baro mode)
 GAINS_ALTITUDE_TARGET_PID   = (-0.15, -0.004, -0.08)    # px error  → ud  (image-y inverted vs world-up)
 GAINS_YAW_PID               = (0.25, 0.003, 0.05)       # px error  → yaw
-
 GAINS_FORWARD_BACK_TOF_PID = (-0.85, -0.02, -0.42)   # cm error → fb
-
 GAINS_FORWARD_BACK_BBOX_PID = (400, 0.0, 30.0)   # ratio err → fb
+GAINS_LEFT_RIGHT_PID        = (0.2, 0.01, 0.15)   # px error  → lr
 
-GAINS_LEFT_RIGHT_PID        = (0.08, 0.00, 0.00)   # px error  → lr
-
-
+"""
+GAINS_ALTITUDE_PID          = (0, 0.04, 0.08)         # cm error  → ud  (baro mode)
+GAINS_ALTITUDE_TARGET_PID   = (-0.15, -0.004, -0.08)    # px error  → ud  (image-y inverted vs world-up)
+GAINS_YAW_PID               = (0, 0, 0)       # px error  → yaw
+GAINS_FORWARD_BACK_TOF_PID = (0, 0, 0)   # cm error → fb
+GAINS_FORWARD_BACK_BBOX_PID = (0, 0.0, 0.0)   # ratio err → fb
+GAINS_LEFT_RIGHT_PID        = (0.2, 0.01, 0.15)   # px error  → lr
+"""
 
 # ---- Failure tiers ----
-BATTERY_MEDIUM_PERCENT      = 6
-BATTERY_HARD_PERCENT        = 5
+BATTERY_MEDIUM_PERCENT      = 5
+BATTERY_HARD_PERCENT        = 3
 CONNECTION_DROP_MEDIUM_S    = 5
 CONNECTION_DROP_HARD_S      = 5
 TOF_STUCK_MEDIUM_S          = 5
@@ -75,9 +94,6 @@ ERROR_HOVER_TIMEOUT_S       = 5
 
 # ---- RC loop ----
 RC_LOOP_INTERVAL_S          = 0.05   # 20 Hz
-
-# ---- Mission pad ----
-TAKEOFF_PAD_ID = 1   # pad placed at room center, used as XY origin
 
 
 # ---- Target tracking (Phase 6a) ----

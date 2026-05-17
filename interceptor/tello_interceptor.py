@@ -2,6 +2,7 @@ import csv
 import ctypes
 import ctypes.wintypes
 import os
+import random
 import cv2
 import torch
 import threading
@@ -15,7 +16,13 @@ from .target import TARGET, select_best_person
 
 
 from .constants import (
-    FRONT_TOF_WALL_BACKOFF_CM, TARGET_EMA_ALPHA, FB_MAX_VELOCITY_CM_S, FRAME_CENTER_X, FRAME_CENTER_Y,
+    FRONT_TOF_WALL_BACKOFF_CM, GAINS_LEFT_RIGHT_PID, LR_MAX_VELOCITY_CM_S,
+    SEARCH_SPIN_VELOCITY_DEG_S,
+    SEARCH_MAX_CYCLES, SEARCH_ADVANCE_TOLERANCE_CM, SEARCH_ADVANCE_TIMEOUT_S,
+    SEARCH_OPEN_SPACE_VELOCITY_CM_S,
+    SEARCH_YAW_TOLERANCE_DEG, SEARCH_SAMPLE_EVERY_DEG,
+    GRACE_RECOVERY_YAW_DEG_S, GRACE_RECOVERY_MIN_OFFSET_PX,
+    TARGET_EMA_ALPHA, FB_MAX_VELOCITY_CM_S, FRAME_CENTER_X, FRAME_CENTER_Y,
     TARGET_LOST_GRACE_S, FRONT_TOF_WALL_STOP_CM,
     GAINS_ALTITUDE_PID, GAINS_ALTITUDE_TARGET_PID,
     GAINS_FORWARD_BACK_TOF_PID, GAINS_FORWARD_BACK_BBOX_PID, GAINS_YAW_PID,
@@ -119,12 +126,14 @@ class TelloInterceptor:
         self.yaw_pid =  PIDController(*GAINS_YAW_PID, output_min=-YAW_MAX_VELOCITY_CM_S, output_max=YAW_MAX_VELOCITY_CM_S)
         self.pitch_pid =  PIDController(*GAINS_FORWARD_BACK_TOF_PID, output_min=-FB_MAX_VELOCITY_CM_S, output_max=FB_MAX_VELOCITY_CM_S)
         self.pitch_bbox_pid = PIDController(*GAINS_FORWARD_BACK_BBOX_PID, output_min=-FB_MAX_VELOCITY_CM_S, output_max=FB_MAX_VELOCITY_CM_S)
+        self.roll_pid = PIDController(*GAINS_LEFT_RIGHT_PID, output_min=-LR_MAX_VELOCITY_CM_S, output_max=LR_MAX_VELOCITY_CM_S)
         self.rc = [0, 0, 0, 0]  # left right, forward backward, up down, yaw
 
         # logging for PID tunning
         self._altitude_log: list[tuple] = []
         self._yaw_log: list[tuple] = []
         self._pitch_log: list[tuple] = []
+        self._roll_log: list[tuple] = []
         self._log_start_time: float = 0.0
 
         # last time the active target was visible
@@ -163,6 +172,23 @@ class TelloInterceptor:
 
         self._is_airborne: bool = False
         self._is_toggling_flight: bool = False
+
+        # ---- Search FSM ----
+        # Sub-states: "none" | "spin" | "choose_dir" | "rotate_to_dir" | "advance" | "hover_done"
+        # Sub-state machine lives in searching branch of video_loop. Reset on target re-acquire.
+        self._search_sub_state: str = "none"
+        self._search_sub_state_t0: float = 0.0
+        self._search_cycle_count: int = 0                  # full spin+advance cycles completed
+        self._search_chosen_yaw: float = 0.0
+        # Spin closed-loop on yaw_deg telemetry (no dead-reckoning on time).
+        # accumulated_deg sums per-frame shortest-signed yaw deltas; exits when |sum| >= 360.
+        self._search_spin_yaw_last_deg: float = 0.0
+        self._search_spin_yaw_accumulated_deg: float = 0.0
+        self.available_directions: list[tuple[float, float]] = []  # (yaw_deg, front_tof_cm) samples this spin cycle
+
+        # Last side target was seen on (-1 left, +1 right, 0 centered). Used for edge-loss recovery
+        # in grace branch + initial spin direction. Set in tracking branch each frame.
+        self._last_target_side: int = 0
 
 
     def start(self):
@@ -236,6 +262,10 @@ class TelloInterceptor:
             self._save_pitch_log()
         except Exception as e:
             print(f"[WARN] pitch log save failed: {e}")
+        try:
+            self._save_roll_log()
+        except Exception as e:
+            print(f"[WARN] roll log save failed: {e}")
 
         if not self.phantom_mode and self._is_airborne:
             print("[INFO] Initiating auto-landing on shutdown...")
@@ -310,6 +340,27 @@ class TelloInterceptor:
         )
 
 
+    def _save_roll_log(self) -> None:
+        """Write roll PID log to logs/roll_response.csv.
+
+        Columns:
+            time_s         — seconds since takeoff
+            target_x       — EMA-smoothed target x px (-1 = not tracking)
+            bbox_left      — bbox left edge px (-1 = not tracking)
+            bbox_right     — bbox right edge px (-1 = not tracking)
+            error_roll     — px (target_x - frame_center_x), 0 when inside bbox dead-zone
+            lr_command     — commanded lr velocity (cm/s)
+            inside_bbox    — 1 if target centered horizontally on drone (dead-zone), else 0
+        """
+        if not self._roll_log:
+            return
+        self._save_csv_safe(
+            "logs/roll_response.csv",
+            ["time_s", "target_x", "bbox_left", "bbox_right", "error_roll", "lr_command", "inside_bbox"],
+            self._roll_log,
+        )
+
+
     def _save_altitude_log(self) -> None:
         """Write altitude PID log to logs/altitude_response.csv."""
         if not self._altitude_log:
@@ -322,7 +373,11 @@ class TelloInterceptor:
 
 
     def _video_loop(self):
+        import numpy as np
         cv2.namedWindow("TelloInterceptor", cv2.WINDOW_AUTOSIZE)
+        # Force window render — Windows hides namedWindow until first imshow.
+        cv2.imshow("TelloInterceptor", np.zeros((720, 960, 3), dtype=np.uint8))
+        cv2.waitKey(1)
         drone_video = self.tello.get_frame_read()
 
         frame_count    = 0
@@ -404,13 +459,30 @@ class TelloInterceptor:
             pitch_source = "none"
             closeness_value = -1.0
 
-            # lr currently unused by auto PIDs (Phase 7+); init 0 so manual mode + rc[0] write are safe.
+            # lr default 0 — manual override + rc[0] write are always safe
             lr = 0
+            # roll log defaults (filled in tracking branch)
+            roll_bbox_left = -1.0
+            roll_bbox_right = -1.0
+            error_roll = 0.0
+            roll_inside_bbox = 0
 
             # target visible
             if tracking_target:
                 self._last_target_seen_time = time.time()
                 mode_label = "intercepting"
+
+                # Reset Search FSM — target re-acquired, fresh search starts if lost again
+                self._search_sub_state = "none"
+                self._search_cycle_count = 0
+                self.available_directions = []
+
+                # Track which side target is on for edge-loss recovery (used in grace + search)
+                target_dx = target_x_px - frame_center_x
+                if abs(target_dx) >= GRACE_RECOVERY_MIN_OFFSET_PX:
+                    self._last_target_side = 1 if target_dx > 0 else -1
+                else:
+                    self._last_target_side = 0
 
                 # EMA smooth target position to kill YOLO jitter before differentiating
                 if not self._target_ema_initialized:
@@ -433,7 +505,6 @@ class TelloInterceptor:
                 yaw = self.yaw_pid.compute(error_yaw, RC_LOOP_INTERVAL_S)
 
                 # --- Pitch PID ---
-
                 # ToF PID
                 if valid_front_tof:
                     pitch_source = "tof"
@@ -487,6 +558,24 @@ class TelloInterceptor:
                     self.pitch_bbox_pid.reset_integral()
 
 
+                #--- Roll PID ---
+                bbox_half = tracked_person.bbox_width_pixels / 2
+                bbox_left  = tracked_person.bbox_center_x - bbox_half
+                bbox_right = tracked_person.bbox_center_x + bbox_half
+                roll_bbox_left = float(bbox_left)
+                roll_bbox_right = float(bbox_right)
+
+                if bbox_left <= frame_center_x <= bbox_right:
+                    lr = 0
+                    error_roll = 0.0
+                    roll_inside_bbox = 1
+                    self.roll_pid.reset_integral()
+                else:
+                    error_roll = self._target_smoothed_x_px - frame_center_x
+                    lr = self.roll_pid.compute(error_roll, RC_LOOP_INTERVAL_S)
+                    roll_inside_bbox = 0
+
+
             # target not visible but seen recently -> grace period, hover instead of searching
             elif self._last_target_seen_time > 0 and (time.time() - self._last_target_seen_time) < TARGET_LOST_GRACE_S:
                 mode_label = "hover"
@@ -497,10 +586,14 @@ class TelloInterceptor:
                 self.altitude_pid.reset_integral()
                 self.altitude_target_pid.reset_integral()
 
-                # yaw
+                # yaw — edge-loss recovery. If target vanished off-side, yaw toward last-seen
+                # side to catch them stepping past frame edge. Centered loss → no yaw.
                 error_yaw = 0.0
-                yaw = 0.0
+                yaw = self._last_target_side * GRACE_RECOVERY_YAW_DEG_S
                 self.yaw_pid.reset_integral()
+
+                # roll
+                self.roll_pid.reset_integral()
 
                 # pitch
                 error_pitch = 0.0
@@ -511,6 +604,7 @@ class TelloInterceptor:
                 # EMA — next target = fresh start for both position + closeness
                 self._target_ema_initialized = False
                 self._closeness_ema_initialized = False
+
 
             # target not visible and not in grace -> searching mode
             else:
@@ -523,22 +617,144 @@ class TelloInterceptor:
                 self._closeness_ema_initialized = False
                 ud = self.altitude_pid.compute(error_altitude, RC_LOOP_INTERVAL_S)
 
-                # yaw
-                yaw = 0.0
-                error_yaw = 0.0
-                self.yaw_pid.reset_integral()
-
-                # pitch — only push back from walls during search
-                if valid_front_tof and self.front_tof_cm < INTERCEPT_DISTANCE_CM:
-                    pitch_source = "tof"
-                    error_pitch = INTERCEPT_DISTANCE_CM - self.front_tof_cm
-                    fb = self.pitch_pid.compute(error_pitch, RC_LOOP_INTERVAL_S)
-                else:
-                    pitch_source = "none"
-                    error_pitch = 0.0
-                    fb = 0.0
-                    self.pitch_pid.reset_integral()
+                # roll, pitch bbox — not active during search
+                self.roll_pid.reset_integral()
                 self.pitch_bbox_pid.reset_integral()
+                error_yaw = 0.0
+                error_pitch = 0.0
+                pitch_source = "none"
+
+                # ---- Search  ----
+                # start searching
+                if self._search_sub_state == "none":
+                    self._search_sub_state = "spin"
+                    self._search_sub_state_t0 = time.time()
+                    self._search_cycle_count = 0
+                    self.available_directions = []
+                    # Arm yaw accumulator from current heading
+                    self._search_spin_yaw_last_deg = self.yaw_deg
+                    self._search_spin_yaw_accumulated_deg = 0.0
+
+                if self._search_sub_state == "spin":
+                    # First spin direction = last-seen side (target most likely there).
+                    # _last_target_side defaults 0; treat 0 as +1 (CW) for fresh boot.
+                    spin_sign = self._last_target_side if self._last_target_side != 0 else 1
+                    yaw = spin_sign * SEARCH_SPIN_VELOCITY_DEG_S
+                    fb  = 0.0
+
+                    # Closed-loop rotation tracking via yaw_deg telemetry (no dead-reckoning).
+                    # Per-frame shortest signed delta normalized to [-180, 180] handles yaw wrap.
+                    yaw_delta = (self.yaw_deg - self._search_spin_yaw_last_deg + 540) % 360 - 180
+                    self._search_spin_yaw_accumulated_deg += yaw_delta
+                    self._search_spin_yaw_last_deg = self.yaw_deg
+
+                    # Sample direction every SEARCH_SAMPLE_EVERY_DEG of yaw change.
+                    # Throttled to avoid flooding the list at 30 FPS.
+                    if (not self.available_directions
+                        or abs(self.yaw_deg - self.available_directions[-1][0]) >= SEARCH_SAMPLE_EVERY_DEG):
+                        self.available_directions.append((self.yaw_deg, self.front_tof_cm))
+
+                    # Full rotation completed → choose a direction
+                    if abs(self._search_spin_yaw_accumulated_deg) >= 360.0:
+                         self._search_sub_state = "choose_direction"
+
+
+                elif self._search_sub_state == "choose_direction":
+                    yaw = 0.0
+                    fb  = 0.0
+
+                    # Cycle budget exhausted → stop searching
+                    if self._search_cycle_count >= SEARCH_MAX_CYCLES:
+                        self._search_sub_state = "hover_done"
+                    else:
+                        # Directions where ToF is out-of-range (-1.0) = no obstacle within sensor range = clear path
+                        clear_direction = [(x, y) for x, y in self.available_directions if y == -1.0]
+
+                        # if clear direction is not empty
+                        if clear_direction:
+                            self._search_chosen_yaw = random.choice(clear_direction)[0]
+                            self._search_sub_state = "rotate_to_dir"
+                        else:
+                            # No usable direction this cycle. Sit in hover_done; manual intervention required.
+                            self._search_sub_state = "hover_done"
+
+
+                elif self._search_sub_state == "rotate_to_dir":
+                    # Shortest signed angle to chosen_yaw, normalized to [-180, 180]
+                    delta = (self._search_chosen_yaw - self.yaw_deg + 540) % 360 - 180
+                    # Clamp yaw rate to spin velocity. Proportional on small deltas avoids overshoot.
+                    yaw = max(-SEARCH_SPIN_VELOCITY_DEG_S, min(SEARCH_SPIN_VELOCITY_DEG_S, delta))
+                    fb  = 0.0
+                    if abs(delta) < SEARCH_YAW_TOLERANCE_DEG:
+                        self._search_sub_state = "advance"
+                        self._search_sub_state_t0 = time.time()
+                        # Fresh PID state — advance is a new control task, error_last from prior pitch use is stale
+                        self.pitch_pid.reset_integral()
+                        self.pitch_pid.error_last = 0.0
+
+
+                elif self._search_sub_state == "advance":
+                    # Reuse existing pitch_pid (ToF distance → fb). Tello dead-reckoning is unreliable,
+                    # so advance ends via PID settling on INTERCEPT_DISTANCE_CM, not integrated time.
+                    yaw = 0.0
+                    if valid_front_tof:
+                        error_pitch = INTERCEPT_DISTANCE_CM - self.front_tof_cm
+                        pitch_source = "tof"
+                        fb = self.pitch_pid.compute(error_pitch, RC_LOOP_INTERVAL_S)
+                    else:
+                        # ToF out-of-range = no obstacle within sensor range = open space ahead.
+                        # Push forward at constant velocity until ToF acquires; PID takes over next tick.
+                        error_pitch = 0.0
+                        pitch_source = "none"
+                        fb = SEARCH_OPEN_SPACE_VELOCITY_CM_S
+                        # Keep pitch_pid integral fresh so first PID tick on ToF acquire doesn't kick
+                        self.pitch_pid.reset_integral()
+
+                    settled = valid_front_tof and abs(INTERCEPT_DISTANCE_CM - self.front_tof_cm) < SEARCH_ADVANCE_TOLERANCE_CM
+                    timed_out = (time.time() - self._search_sub_state_t0) > SEARCH_ADVANCE_TIMEOUT_S
+                    if settled or timed_out:
+                        self._search_cycle_count += 1
+                        self.available_directions = []
+                        self._search_sub_state = "spin"
+                        self._search_sub_state_t0 = time.time()
+                        # Re-arm yaw accumulator for next spin cycle
+                        self._search_spin_yaw_last_deg = self.yaw_deg
+                        self._search_spin_yaw_accumulated_deg = 0.0
+
+                else:  # "hover_done"
+                    yaw = 0.0
+                    fb  = 0.0
+
+
+            
+
+    
+                    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -608,6 +824,16 @@ class TelloInterceptor:
                 pitch_source,
             ))
 
+            self._roll_log.append((
+                time.time() - self._log_start_time,
+                self._target_smoothed_x_px if tracking_target else -1,
+                roll_bbox_left,
+                roll_bbox_right,
+                error_roll,
+                lr,
+                roll_inside_bbox,
+            ))
+
             # Latch pitch source for next-frame transition detection (D-term seeding).
             self._pitch_source_last = pitch_source
 
@@ -672,6 +898,7 @@ class TelloInterceptor:
                 self.yaw_pid.reset_integral()
                 self.pitch_pid.reset_integral()
                 self.pitch_bbox_pid.reset_integral()
+                self.roll_pid.reset_integral()
 
         cv2.destroyAllWindows()
 
@@ -712,12 +939,7 @@ class TelloInterceptor:
         )
 
     def _update_front_tof(self):
-        """Background thread: read front ToF + down ToF at ~5 Hz.
-
-        Sleep matters: spamming `EXT tof?` holds _sdk_lock for ~100ms per call with
-        no gap, starves the RC thread, and stresses WiFi → H264 decoder errors
-        (`error while decoding MB ...`) → dead frames → auto-land.
-        """
+    
         while self.front_tof_active:
             try:
                 # frontward ToF — single short critical section, then release lock
@@ -731,12 +953,18 @@ class TelloInterceptor:
                 state = self.tello.get_current_state()
                 if state:
                     self.down_tof_cm = state.get("tof", -1)
-                    # Baro is primary altitude per CLAUDE.md. Down ToF is obstacle-warning only.
-                    self.height_cm = state.get("h", -1)
+                    baro_cm = state.get("h", -1)
+                 
+                    if self.down_tof_cm > 0 and baro_cm > 0:
+                        self.height_cm = max(self.down_tof_cm, baro_cm)
+                    elif self.down_tof_cm > 0:
+                        self.height_cm = self.down_tof_cm
+                    else:
+                        self.height_cm = baro_cm
 
             except Exception:
                 pass
-            time.sleep(0.2)  # 5 Hz — enough for wall avoidance, frees SDK + WiFi
+        
 
     def _update_telemetry(self):
         while self.telemetry_active:
@@ -755,13 +983,6 @@ class TelloInterceptor:
                     self.battery_percent = state.get("bat",  -1)
                     self.min_temp_C = state.get("templ",  -1)
                     self.max_temp_C = state.get("temph",  -1)
-
-                    # Mission pad — `mid` = -1 when no pad detected. x/y/z in cm relative to pad center.
-                    self.mission_pad_id   = state.get("mid", -1)
-                    self.mission_pad_x_cm = state.get("x",   0)
-                    self.mission_pad_y_cm = state.get("y",   0)
-                    self.mission_pad_z_cm = state.get("z",   0)
-
 
             except Exception:
                 pass
