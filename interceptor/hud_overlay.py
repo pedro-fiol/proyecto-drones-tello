@@ -15,6 +15,8 @@ import cv2
 import numpy as np
 from typing import TYPE_CHECKING, Optional
 
+from interceptor.constants import FRONT_TOF_WALL_STOP_CM
+
 if TYPE_CHECKING:
     from interceptor.perception import Person
     from interceptor.target import Target
@@ -95,6 +97,19 @@ def draw_phantom_badge(frame: np.ndarray) -> None:
     h, w = frame.shape[:2]
     cv2.putText(frame, "PHANTOM", (w - 220, 50),
                 HUD_FONT, 1.0, COLOR_FACE_BOX, 3)
+
+
+def draw_wall_warning(frame: np.ndarray, front_tof_cm: float, threshold_cm: float = FRONT_TOF_WALL_STOP_CM) -> None:
+    """Big red WALL badge centered when front ToF inside threshold. Manual-mode crash aid."""
+    if front_tof_cm <= 0 or front_tof_cm > threshold_cm:
+        return
+    h, w = frame.shape[:2]
+    text = f"WALL {int(front_tof_cm)} cm"
+    (tw, th), _ = cv2.getTextSize(text, HUD_FONT, 1.2, 4)
+    x = (w - tw) // 2
+    y = h // 2 + 80
+    cv2.rectangle(frame, (x - 14, y - th - 14), (x + tw + 14, y + 14), (0, 0, 0), -1)
+    cv2.putText(frame, text, (x, y), HUD_FONT, 1.2, (0, 0, 255), 4)
 
 
 def draw_control_mode_badge(

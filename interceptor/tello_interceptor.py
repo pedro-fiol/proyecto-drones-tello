@@ -2,7 +2,6 @@ import csv
 import ctypes
 import ctypes.wintypes
 import os
-import random
 import cv2
 import torch
 import threading
@@ -14,25 +13,46 @@ from .pid_controller import PIDController
 from .perception import Person, PersonDetector
 from .target import TARGET, select_best_person
 
-
 from .constants import (
-    FRONT_TOF_WALL_BACKOFF_CM, GAINS_LEFT_RIGHT_PID, LR_MAX_VELOCITY_CM_S,
+    GAINS_LEFT_RIGHT_PID, LR_MAX_VELOCITY_CM_S,
     SEARCH_SPIN_VELOCITY_DEG_S,
-    SEARCH_MAX_CYCLES, SEARCH_ADVANCE_TOLERANCE_CM, SEARCH_ADVANCE_TIMEOUT_S,
+    SEARCH_ADVANCE_TOLERANCE_CM, SEARCH_ADVANCE_TIMEOUT_S,
     SEARCH_OPEN_SPACE_VELOCITY_CM_S,
-    SEARCH_YAW_TOLERANCE_DEG, SEARCH_SAMPLE_EVERY_DEG,
     GRACE_RECOVERY_YAW_DEG_S, GRACE_RECOVERY_MIN_OFFSET_PX,
     TARGET_EMA_ALPHA, FB_MAX_VELOCITY_CM_S, FRAME_CENTER_X, FRAME_CENTER_Y,
-    TARGET_LOST_GRACE_S, FRONT_TOF_WALL_STOP_CM,
+    TARGET_LOST_GRACE_S, FRONT_TOF_WALL_STOP_CM, FRONT_TOF_DISCONTINUITY_FREEZE_S,
+    FRONT_TOF_INVALID_HYSTERESIS_FRAMES,
+    SEARCH_SPIN_CLEAR_FRAMES, SEARCH_ADVANCE_MAX_DISTANCE_CM,
+    SEARCH_ADVANCE_SWEEP_EVERY_S, SEARCH_ADVANCE_SWEEP_YAW_DEG_S,
+    SEARCH_ADVANCE_SWEEP_ARC_DEG, SEARCH_ADVANCE_SWEEP_WALL_CM,
+    IMU_SHOCK_THRESHOLD_CM_S2, IMU_SHOCK_FREEZE_S,
     GAINS_ALTITUDE_PID, GAINS_ALTITUDE_TARGET_PID,
     GAINS_FORWARD_BACK_TOF_PID, GAINS_FORWARD_BACK_BBOX_PID, GAINS_YAW_PID,
     INTERCEPT_DISTANCE_CM,
     MANUAL_FB_VELOCITY_CM_S, MANUAL_LR_VELOCITY_CM_S,
     MANUAL_UD_VELOCITY_CM_S, MANUAL_YAW_VELOCITY_DEG_S,
     MAX_TRACKING_ALTITUDE_CM, MIN_TRACKING_ALTITUDE_CM,
-    RC_LOOP_INTERVAL_S, TARGET_ALTITUDE_CM, UD_MAX_VELOCITY_CM_S, WALL_BACKOFF_VELOCITY_CM_S, YAW_MAX_VELOCITY_CM_S,
+    RC_LOOP_INTERVAL_S, TARGET_ALTITUDE_CM, UD_MAX_VELOCITY_CM_S, YAW_MAX_VELOCITY_CM_S,
     YOLO_FRAME_STRIDE,
 )
+
+from .hud_overlay import (
+    draw_control_mode_badge,
+    draw_detection_state,
+    draw_target_y_line,
+    draw_frame_crosshair,
+    draw_person_overlays,
+    draw_phantom_badge,
+    draw_telemetry_strip,
+    draw_wall_warning,
+)
+
+
+os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
+logging.getLogger("djitellopy").setLevel(logging.WARNING)
+
+
+
 
 
 # ---- Windows keyboard input (manual mode) ----
@@ -71,26 +91,18 @@ def _drain_keyboard_messages() -> None:
         pass
 
 
-from .hud_overlay import (
-    draw_control_mode_badge,
-    draw_detection_state,
-    draw_target_y_line,
-    draw_frame_crosshair,
-    draw_person_overlays,
-    draw_phantom_badge,
-    draw_telemetry_strip,
-)
 
-os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
-
-
-logging.getLogger("djitellopy").setLevel(logging.WARNING)
-
+""" 
+Use GPU if availible: run with ".\venv\Scripts\python.exe"
+"""
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
 print(f"[INFO] Using device: {DEVICE}")
 
 
+
+"""
+Tello Interceptor main class. Handles all drone logic.
+"""
 class TelloInterceptor:
     # Phantom mode -> Drone does not take off
     def __init__(self, phantom_mode: bool = False):
@@ -138,7 +150,6 @@ class TelloInterceptor:
 
         # last time the active target was visible
         # Used to avoid switching to searching mode (no target detected) due to detection jitter
-        self._last_target_seen_time: float = 0.0
 
         # EMA-smoothed target position for PIDs (kills YOLO ±5px jitter)
         self._target_smoothed_x_px: float = 0.0
@@ -155,6 +166,11 @@ class TelloInterceptor:
         # On switch, the incoming PID's error_last is seeded with current error so the
         # first D-term doesn't spike off a stale error from a different unit system.
         self._pitch_source_last: str = "none"
+
+        # ToF→bbox hysteresis: count consecutive invalid front-ToF frames. Stay in ToF
+        # mode (using last valid reading) until count exceeds threshold.
+        self._tof_invalid_count: int = 0
+        self._last_valid_front_tof_cm: float = -1.0
 
         # Manual keyboard control
         self.is_manual: bool = False
@@ -174,23 +190,47 @@ class TelloInterceptor:
         self._is_toggling_flight: bool = False
 
         # ---- Search FSM ----
-        # Sub-states: "none" | "spin" | "choose_dir" | "rotate_to_dir" | "advance" | "hover_done"
-        # Sub-state machine lives in searching branch of video_loop. Reset on target re-acquire.
-        self._search_sub_state: str = "none"
+        # Sub-states: "none" | "spin" | "advance"
+        # Greedy reactive spin: drone yaws until front ToF reads -1 (out of 120cm range = clear path),
+        # then advances forward until wall stop or PID settle, then spins again. Loops forever
+        # until target re-acquired (FSM resets in tracking branch) or battery dies.
+        # Only yaw runs during spin. Only pitch (fb) runs during advance. Altitude PID active throughout.
+        self._search_state: str = "none"
         self._search_sub_state_t0: float = 0.0
-        self._search_cycle_count: int = 0                  # full spin+advance cycles completed
-        self._search_chosen_yaw: float = 0.0
-        # Spin closed-loop on yaw_deg telemetry (no dead-reckoning on time).
-        # accumulated_deg sums per-frame shortest-signed yaw deltas; exits when |sum| >= 360.
-        self._search_spin_yaw_last_deg: float = 0.0
-        self._search_spin_yaw_accumulated_deg: float = 0.0
-        self.available_directions: list[tuple[float, float]] = []  # (yaw_deg, front_tof_cm) samples this spin cycle
+
+        # last time the active target was visible
+        # Used to avoid switching to searching mode (no target detected) due to detection jitter
+        self._last_target_seen_time: float = 0.0
 
         # Last side target was seen on (-1 left, +1 right, 0 centered). Used for edge-loss recovery
         # in grace branch + initial spin direction. Set in tracking branch each frame.
         self._last_target_side: int = 0
 
+        # Diagonal-wall mitigation: track prev front_tof reading + freeze timestamp.
+        # On valid → -1 transition, set freeze_until = now + FRONT_TOF_DISCONTINUITY_FREEZE_S.
+        # Safety block blocks fb>0 while freeze active. Catches drone flying past wall edge.
+        self._front_tof_cm_prev: float = -1.0
+        self._front_tof_freeze_until: float = 0.0
 
+        # Sustained clearance gate (H): N consecutive ToF=-1 frames in spin before exit.
+        self._search_spin_clear_count: int = 0
+
+        # Advance sub-FSM (B + I): phases = "moving" | "sweeping". Distance cap + periodic sweep.
+        self._advance_phase: str = "moving"
+        self._advance_phase_t0: float = 0.0
+        self._advance_last_sweep_t: float = 0.0
+        self._advance_distance_cm: float = 0.0
+        self._advance_sweep_obstacle: bool = False
+
+        # Shock detect (D): IMU accel spike → freeze all axes for IMU_SHOCK_FREEZE_S.
+        # Set in telemetry thread, checked in safety block.
+        self._shock_freeze_until: float = 0.0
+
+
+
+    """
+    Starts drone connection, video stream, and all threads.
+    """
     def start(self):
 
         print("[INFO] Connecting to Tello...")
@@ -202,13 +242,13 @@ class TelloInterceptor:
         try:
             self.tello.send_rc_control(0, 0, 0, 0)
             self.tello.land()
-        except TelloException:
+        except TelloException: 
             pass
         try:
             self.tello.streamoff()
         except TelloException:
             pass
-        time.sleep(2.5)  # Increased delay to allow drone + SDK socket to reset
+        time.sleep(2.5) 
 
         print("[INFO] Starting video stream...")
         self.tello.streamon()
@@ -231,15 +271,22 @@ class TelloInterceptor:
         self.telemetry_active   = True
         self.rc_loop_active     = True
 
+        
+        # Video loop in main trhead, rc control, telemetry and sensor reading in separate threads.
         threading.Thread(target=self._update_telemetry, daemon=True).start()
         threading.Thread(target=self._update_front_tof, daemon=True).start()
         threading.Thread(target=self._rc_control_loop, daemon=True).start()
 
         self._video_loop()
 
+
+    """
+    Stops all threads and lands drone. Saves logs.
+    """
     def stop(self):
         if self._stop_finished:
             return
+        
         # Kill ToF thread FIRST and wait for in-flight EXT tof? (timeout=1s) to drain.
         # Otherwise its response gets queued and 'land'/'streamoff' read it instead of 'ok'.
         self.front_tof_active = False
@@ -290,7 +337,6 @@ class TelloInterceptor:
 
 
     def _save_csv_safe(self, path: str, header: list, rows: list) -> None:
-        """Write CSV. On PermissionError (file locked), fall back to timestamped name."""
         os.makedirs("logs", exist_ok=True)
         try:
             with open(path, "w", newline="") as f:
@@ -310,7 +356,6 @@ class TelloInterceptor:
 
 
     def _save_yaw_log(self) -> None:
-        """Write yaw PID log to logs/yaw_response.csv."""
         if not self._yaw_log:
             return
         self._save_csv_safe(
@@ -372,12 +417,16 @@ class TelloInterceptor:
         )
 
 
+
+    """
+    Main loop, handles video, detection, and intercept logic.
+    """
     def _video_loop(self):
         import numpy as np
         cv2.namedWindow("TelloInterceptor", cv2.WINDOW_AUTOSIZE)
-        # Force window render — Windows hides namedWindow until first imshow.
         cv2.imshow("TelloInterceptor", np.zeros((720, 960, 3), dtype=np.uint8))
         cv2.waitKey(1)
+
         drone_video = self.tello.get_frame_read()
 
         frame_count    = 0
@@ -387,103 +436,131 @@ class TelloInterceptor:
         frame_center_y = FRAME_CENTER_Y
 
         while self.video_active:
+            # leer cada frame del stream de video
             current_frame = drone_video.frame
+
+            """
+            Handle missing frames
+            """
             if current_frame is None:
                 consecutive_none_frames += 1
-                # Exit only after a long, sustained outage. H264 decoder hiccups can
-                # produce 1-3s bursts of None frames and self-recover; do not pull the
-                # plug (and land) on those. 300 ≈ 10s.
                 if consecutive_none_frames > 300:
-                    print("[ERROR] Video stream dead — H.264 decoder stuck. Exiting.")
+                    print("[ERROR] Video stream dead ")
                     self.video_active = False
                     break
-                # Keep cv2 window pumping and ESC alive even when no frame is ready.
                 cv2.waitKey(1)
+
+                # for manual keyboard control
                 self._poll_keyboard()
                 if self._esc_rising_edge:
                     self.video_active = False
                     break
+                
                 time.sleep(0.01)
                 continue
-            consecutive_none_frames = 0  # Reset counter on successful frame
 
+            # Reset counter on successful frame
+            consecutive_none_frames = 0 
+
+
+            """
+            Get frame center and target vertical setpoint
+            """
             # derive true center from actual frame size
             h, w = current_frame.shape[:2]
             frame_center_x = w // 2
             frame_center_y = h // 2
-            target_setpoint_x_px = frame_center_x                       # yaw setpoint: target centered horizontally
+
             target_setpoint_y_px = int(h * TARGET.target_y_ratio)       # alt setpoint: per-target framing
 
             frame_count += 1
 
-            # --- Pose detection every YOLO_STRIDE frames ---
+
+            """
+            Pose detection every YOLO_STRIDE frames
+            """
             if frame_count % YOLO_FRAME_STRIDE == 0:
                 detected_persons = self.person_detector.detect_persons_in_frame(current_frame)
 
-            # --- Single-person filter — Phase 6a is single-target by spec ---
+            # work in progress
             best_person = select_best_person(detected_persons, TARGET)
             persons_to_draw = [best_person] if best_person is not None else []
 
-            # --- HUD overlays ---
+            """
+            HUD overlays
+            """
             target_x_px, target_y_px, tracking_target, tracked_person = draw_person_overlays(
                 current_frame, persons_to_draw, TARGET
             )
+
             draw_frame_crosshair(current_frame, frame_center_x, frame_center_y)
+
             draw_target_y_line(current_frame, target_setpoint_y_px)
 
             draw_detection_state(current_frame, target_x_px, target_y_px, frame_center_x,
                                  target_setpoint_y_px, tracking_target, target_name=TARGET.name)
+            
             draw_telemetry_strip(current_frame, self)
+
             if self.phantom_mode:
                 draw_phantom_badge(current_frame)
+
             draw_control_mode_badge(
                 current_frame, self.is_manual,
                 self.manual_lr, self.manual_fb, self.manual_ud, self.manual_yaw,
             )
 
+            draw_wall_warning(current_frame, self.front_tof_cm)
+
             tracking_target = tracking_target and target_y_px is not None and target_x_px is not None
 
 
-            # --- PID ---
-            # Three modes:
-            #   INTERCEPTING — target visible, park target at TARGET.target_y_ratio via target PID
-            #   HOVER        — target lost < TARGET_LOST_GRACE_S ago, ud=0 (Tello holds via baro+optical-flow)
-            #   SEARCHING    — target lost > TARGET_LOST_GRACE_S, hold TARGET_ALTITUDE_CM via baro PID
-            #
-            # YOLO detection jitter -> drone switches between intercepting and searching modes rapidly -> PID controller oscillates
-            # Fix: grace period after target loss where drone enters HOVER mode
+            """ 
+            Intercept logic and actuation
+                --- PID ---
+                Three modes:
+                INTERCEPTING — target visible, park target at TARGET.target_y_ratio via target PID
+                HOVER        — target lost < TARGET_LOST_GRACE_S ago, ud=0 (Tello holds via baro+optical-flow)
+                SEARCHING    — target lost > TARGET_LOST_GRACE_S, hold TARGET_ALTITUDE_CM via baro PID
 
+                YOLO detection jitter -> drone switches between intercepting and searching modes rapidly -> PID controller oscillates
+                Fix: grace period after target loss where drone enters HOVER mode
+            """
             valid_front_tof = self.front_tof_cm > 0
 
             # default pitch logging fields (filled per branch)
             pitch_source = "none"
             closeness_value = -1.0
 
-            # lr default 0 — manual override + rc[0] write are always safe
+
+            # Each mode of the drone will compute the velocity commands this is just for safety
             lr = 0
+            fb = 0
+            ud = 0
+            yaw = 0
+
             # roll log defaults (filled in tracking branch)
             roll_bbox_left = -1.0
             roll_bbox_right = -1.0
             error_roll = 0.0
             roll_inside_bbox = 0
 
-            # target visible
+            # Target visible -> INTERCEPTING mode
             if tracking_target:
                 self._last_target_seen_time = time.time()
                 mode_label = "intercepting"
 
-                # Reset Search FSM — target re-acquired, fresh search starts if lost again
-                self._search_sub_state = "none"
-                self._search_cycle_count = 0
-                self.available_directions = []
+                # Reset Search if target re-acquired after loss
+                self._search_state = "none"
 
                 # Track which side target is on for edge-loss recovery (used in grace + search)
-                target_dx = target_x_px - frame_center_x
-                if abs(target_dx) >= GRACE_RECOVERY_MIN_OFFSET_PX:
-                    self._last_target_side = 1 if target_dx > 0 else -1
-                else:
-                    self._last_target_side = 0
-
+                target_side = target_x_px - frame_center_x
+                if target_side > 0: # target on right side of frame
+                    self._last_target_side = 1
+                elif target_side < 0: # target on left side of frame
+                    self._last_target_side = -1
+                
+            
                 # EMA smooth target position to kill YOLO jitter before differentiating
                 if not self._target_ema_initialized:
                     self._target_smoothed_x_px = float(target_x_px)
@@ -495,61 +572,58 @@ class TelloInterceptor:
                     self._target_smoothed_y_px = (TARGET_EMA_ALPHA * target_y_px +
                                                   (1.0 - TARGET_EMA_ALPHA) * self._target_smoothed_y_px)
 
-                # All errors use convention: error = target - measurement (with sign baked into Kp)
-                # --- Target Altitude PID ---
-                error_altitude = self._target_smoothed_y_px - target_setpoint_y_px   # px (+ve = target below setpoint in image)
-                ud = self.altitude_target_pid.compute(error_altitude, RC_LOOP_INTERVAL_S)
-
-                # --- Yaw PID ---
-                error_yaw = self._target_smoothed_x_px - frame_center_x   # px (+ve = target right of center → CW)
-                yaw = self.yaw_pid.compute(error_yaw, RC_LOOP_INTERVAL_S)
-
-                # --- Pitch PID ---
-                # ToF PID
-                if valid_front_tof:
-                    pitch_source = "tof"
-                    error_pitch = INTERCEPT_DISTANCE_CM - self.front_tof_cm
-
-                    # Switching INTO ToF: seed error_last to current err so D-term
-                    # doesn't spike off whatever was last in pitch_pid (possibly stale).
-                    if self._pitch_source_last != "tof":
-                        self.pitch_pid.error_last = error_pitch
-
-                    fb = self.pitch_pid.compute(error_pitch, RC_LOOP_INTERVAL_S)
-                    self.pitch_bbox_pid.reset_integral()
-
-
-                    # Invalidate closeness EMA so next bbox switch re-inits cleanly
-                    # rather than blending fresh detection with frozen stale value.
-                    self._closeness_ema_initialized = False
-
-                elif tracked_person is not None and TARGET.is_visible(tracked_person):
+                # EMA-smooth closeness same way (bbox PID consumes it when ToF fallback fires)
+                if tracked_person is not None and TARGET.is_visible(tracked_person):
                     raw_closeness = TARGET.closeness(tracked_person)
-
-                    # EMA-smooth closeness before PID. Same TARGET_EMA_ALPHA as target x/y EMA.
                     if not self._closeness_ema_initialized:
                         self._closeness_smoothed = float(raw_closeness)
                         self._closeness_ema_initialized = True
                     else:
                         self._closeness_smoothed = (TARGET_EMA_ALPHA * raw_closeness +
                                                     (1.0 - TARGET_EMA_ALPHA) * self._closeness_smoothed)
+
+
+                # --- Target Altitude PID ---
+                # All errors use convention: error = target - measurement, then adjust gains sign accordingly
+                error_altitude = self._target_smoothed_y_px - target_setpoint_y_px
+                ud = self.altitude_target_pid.compute(error_altitude, RC_LOOP_INTERVAL_S)
+
+
+                # --- Yaw PID ---
+                error_yaw = self._target_smoothed_x_px - frame_center_x   
+                yaw = self.yaw_pid.compute(error_yaw, RC_LOOP_INTERVAL_S)
+
+
+                # --- Pitch PID ---
+                # ToF hysteresis: cache last valid reading; stay in ToF mode until
+                # N consecutive invalid frames seen. Stops ToF↔bbox flicker at edge of range.
+                if valid_front_tof:
+                    self._tof_invalid_count = 0
+                    self._last_valid_front_tof_cm = self.front_tof_cm
+                else:
+                    self._tof_invalid_count += 1
+
+                if self._last_valid_front_tof_cm > 0 and self._tof_invalid_count < FRONT_TOF_INVALID_HYSTERESIS_FRAMES:
+                    pitch_source = "tof"
+                    error_pitch = INTERCEPT_DISTANCE_CM - self._last_valid_front_tof_cm
+
+                    # Switching INTO ToF: seed error_last so D-term doesn't spike off stale ratio-unit err.
+                    if self._pitch_source_last != "tof":
+                        self.pitch_pid.error_last = error_pitch
+
+                    fb = self.pitch_pid.compute(error_pitch, RC_LOOP_INTERVAL_S)
+                    self.pitch_bbox_pid.reset_integral()
+
+                elif self._closeness_ema_initialized:
                     closeness_value = self._closeness_smoothed
-                    
-                    if closeness_value < TARGET.closeness_setpoint:
-                        pitch_source = "bbox"
-                        error_pitch = TARGET.closeness_setpoint - closeness_value
-                        # Switching INTO bbox: seed error_last (ratio units) to avoid
-                        # D-spike off a stale ToF-unit error from previous bbox use.
-                        if self._pitch_source_last != "bbox":
-                            self.pitch_bbox_pid.error_last = error_pitch
-                        fb = self.pitch_bbox_pid.compute(error_pitch, RC_LOOP_INTERVAL_S)
-                        self.pitch_pid.reset_integral()
-                    else:
-                        pitch_source = "none"
-                        error_pitch = 0.0
-                        fb = 0.0
-                        self.pitch_pid.reset_integral()
-                        self.pitch_bbox_pid.reset_integral()
+                    pitch_source = "bbox"
+                    error_pitch = TARGET.closeness_setpoint - closeness_value
+                    # Switching INTO bbox: seed error_last to avoid D-spike off stale cm-unit err.
+                    if self._pitch_source_last != "bbox":
+                        self.pitch_bbox_pid.error_last = error_pitch
+                    fb = self.pitch_bbox_pid.compute(error_pitch, RC_LOOP_INTERVAL_S)
+                    self.pitch_pid.reset_integral()
+
                 else:
                     pitch_source = "none"
                     error_pitch = 0.0
@@ -626,104 +700,100 @@ class TelloInterceptor:
 
                 # ---- Search  ----
                 # start searching
-                if self._search_sub_state == "none":
-                    self._search_sub_state = "spin"
+                if self._search_state == "none":
+                    self._search_state = "spin"
                     self._search_sub_state_t0 = time.time()
-                    self._search_cycle_count = 0
-                    self.available_directions = []
-                    # Arm yaw accumulator from current heading
-                    self._search_spin_yaw_last_deg = self.yaw_deg
-                    self._search_spin_yaw_accumulated_deg = 0.0
 
-                if self._search_sub_state == "spin":
+                if self._search_state == "spin":
                     # First spin direction = last-seen side (target most likely there).
                     # _last_target_side defaults 0; treat 0 as +1 (CW) for fresh boot.
                     spin_sign = self._last_target_side if self._last_target_side != 0 else 1
                     yaw = spin_sign * SEARCH_SPIN_VELOCITY_DEG_S
                     fb  = 0.0
 
-                    # Closed-loop rotation tracking via yaw_deg telemetry (no dead-reckoning).
-                    # Per-frame shortest signed delta normalized to [-180, 180] handles yaw wrap.
-                    yaw_delta = (self.yaw_deg - self._search_spin_yaw_last_deg + 540) % 360 - 180
-                    self._search_spin_yaw_accumulated_deg += yaw_delta
-                    self._search_spin_yaw_last_deg = self.yaw_deg
-
-                    # Sample direction every SEARCH_SAMPLE_EVERY_DEG of yaw change.
-                    # Throttled to avoid flooding the list at 30 FPS.
-                    if (not self.available_directions
-                        or abs(self.yaw_deg - self.available_directions[-1][0]) >= SEARCH_SAMPLE_EVERY_DEG):
-                        self.available_directions.append((self.yaw_deg, self.front_tof_cm))
-
-                    # Full rotation completed → choose a direction
-                    if abs(self._search_spin_yaw_accumulated_deg) >= 360.0:
-                         self._search_sub_state = "choose_direction"
-
-
-                elif self._search_sub_state == "choose_direction":
-                    yaw = 0.0
-                    fb  = 0.0
-
-                    # Cycle budget exhausted → stop searching
-                    if self._search_cycle_count >= SEARCH_MAX_CYCLES:
-                        self._search_sub_state = "hover_done"
+                    # Sustained clearance gate: require N consecutive ToF=-1 frames before exit.
+                    # Validates clear direction is genuinely wide-open (not narrow gap aimed at wall).
+                    if self.front_tof_cm == -1.0:
+                        self._search_spin_clear_count += 1
                     else:
-                        # Directions where ToF is out-of-range (-1.0) = no obstacle within sensor range = clear path
-                        clear_direction = [(x, y) for x, y in self.available_directions if y == -1.0]
+                        self._search_spin_clear_count = 0
 
-                        # if clear direction is not empty
-                        if clear_direction:
-                            self._search_chosen_yaw = random.choice(clear_direction)[0]
-                            self._search_sub_state = "rotate_to_dir"
-                        else:
-                            # No usable direction this cycle. Sit in hover_done; manual intervention required.
-                            self._search_sub_state = "hover_done"
-
-
-                elif self._search_sub_state == "rotate_to_dir":
-                    # Shortest signed angle to chosen_yaw, normalized to [-180, 180]
-                    delta = (self._search_chosen_yaw - self.yaw_deg + 540) % 360 - 180
-                    # Clamp yaw rate to spin velocity. Proportional on small deltas avoids overshoot.
-                    yaw = max(-SEARCH_SPIN_VELOCITY_DEG_S, min(SEARCH_SPIN_VELOCITY_DEG_S, delta))
-                    fb  = 0.0
-                    if abs(delta) < SEARCH_YAW_TOLERANCE_DEG:
-                        self._search_sub_state = "advance"
+                    if self._search_spin_clear_count >= SEARCH_SPIN_CLEAR_FRAMES:
+                        yaw = 0.0
+                        self._search_state = "advance"
                         self._search_sub_state_t0 = time.time()
-                        # Fresh PID state — advance is a new control task, error_last from prior pitch use is stale
+                        # Fresh PID state — advance is a new control task
                         self.pitch_pid.reset_integral()
                         self.pitch_pid.error_last = 0.0
+                        # Init advance sub-FSM
+                        self._advance_phase = "moving"
+                        self._advance_phase_t0 = time.time()
+                        self._advance_last_sweep_t = time.time()
+                        self._advance_distance_cm = 0.0
+                        self._advance_sweep_obstacle = False
 
 
-                elif self._search_sub_state == "advance":
-                    # Reuse existing pitch_pid (ToF distance → fb). Tello dead-reckoning is unreliable,
-                    # so advance ends via PID settling on INTERCEPT_DISTANCE_CM, not integrated time.
+                elif self._search_state == "advance":
+                    # Advance sub-FSM: "moving" pushes forward, "sweeping" pauses fb to yaw ±arc
+                    # checking ToF for diagonal walls. Distance cap forces periodic re-spin.
+                    now = time.time()
                     yaw = 0.0
-                    if valid_front_tof:
-                        error_pitch = INTERCEPT_DISTANCE_CM - self.front_tof_cm
-                        pitch_source = "tof"
-                        fb = self.pitch_pid.compute(error_pitch, RC_LOOP_INTERVAL_S)
-                    else:
-                        # ToF out-of-range = no obstacle within sensor range = open space ahead.
-                        # Push forward at constant velocity until ToF acquires; PID takes over next tick.
-                        error_pitch = 0.0
-                        pitch_source = "none"
-                        fb = SEARCH_OPEN_SPACE_VELOCITY_CM_S
-                        # Keep pitch_pid integral fresh so first PID tick on ToF acquire doesn't kick
-                        self.pitch_pid.reset_integral()
 
-                    settled = valid_front_tof and abs(INTERCEPT_DISTANCE_CM - self.front_tof_cm) < SEARCH_ADVANCE_TOLERANCE_CM
-                    timed_out = (time.time() - self._search_sub_state_t0) > SEARCH_ADVANCE_TIMEOUT_S
-                    if settled or timed_out:
-                        self._search_cycle_count += 1
-                        self.available_directions = []
-                        self._search_sub_state = "spin"
-                        self._search_sub_state_t0 = time.time()
-                        # Re-arm yaw accumulator for next spin cycle
-                        self._search_spin_yaw_last_deg = self.yaw_deg
-                        self._search_spin_yaw_accumulated_deg = 0.0
+                    if self._advance_phase == "moving":
+                        if valid_front_tof:
+                            error_pitch = INTERCEPT_DISTANCE_CM - self.front_tof_cm
+                            pitch_source = "tof"
+                            fb = max(0.0, self.pitch_pid.compute(error_pitch, RC_LOOP_INTERVAL_S))
+                        else:
+                            # ToF out-of-range = no obstacle within sensor range = open space ahead.
+                            error_pitch = 0.0
+                            pitch_source = "none"
+                            fb = SEARCH_OPEN_SPACE_VELOCITY_CM_S
+                            self.pitch_pid.reset_integral()
 
-                else:  # "hover_done"
-                    yaw = 0.0
-                    fb  = 0.0
+                        # Distance integration (approx — uses RC tick interval as dt, conservative)
+                        self._advance_distance_cm += fb * RC_LOOP_INTERVAL_S
+
+                        settled = valid_front_tof and abs(INTERCEPT_DISTANCE_CM - self.front_tof_cm) < SEARCH_ADVANCE_TOLERANCE_CM
+                        timed_out = (now - self._search_sub_state_t0) > SEARCH_ADVANCE_TIMEOUT_S
+                        distance_capped = self._advance_distance_cm >= SEARCH_ADVANCE_MAX_DISTANCE_CM
+
+                        if settled or timed_out or distance_capped:
+                            self._search_state = "spin"
+                            self._search_sub_state_t0 = now
+                            self._search_spin_clear_count = 0
+                        elif now - self._advance_last_sweep_t >= SEARCH_ADVANCE_SWEEP_EVERY_S:
+                            self._advance_phase = "sweeping"
+                            self._advance_phase_t0 = now
+                            self._advance_sweep_obstacle = False
+
+                    else:  # "sweeping"
+                        fb = 0.0
+                        elapsed = now - self._advance_phase_t0
+                        leg_s = SEARCH_ADVANCE_SWEEP_ARC_DEG / SEARCH_ADVANCE_SWEEP_YAW_DEG_S
+                        # leg1 0..leg_s: yaw + (right by arc)
+                        # leg2 leg_s..3*leg_s: yaw - (left back to -arc)
+                        # leg3 3*leg_s..4*leg_s: yaw + (return to 0)
+                        if elapsed < leg_s:
+                            yaw = SEARCH_ADVANCE_SWEEP_YAW_DEG_S
+                        elif elapsed < 3 * leg_s:
+                            yaw = -SEARCH_ADVANCE_SWEEP_YAW_DEG_S
+                        elif elapsed < 4 * leg_s:
+                            yaw = SEARCH_ADVANCE_SWEEP_YAW_DEG_S
+                        else:
+                            yaw = 0.0
+                            if self._advance_sweep_obstacle:
+                                # Diagonal wall detected during sweep → abort advance, re-spin
+                                self._search_state = "spin"
+                                self._search_sub_state_t0 = now
+                                self._search_spin_clear_count = 0
+                            else:
+                                self._advance_phase = "moving"
+                                self._advance_last_sweep_t = now
+
+                        # Watch ToF during sweep — any close reading = off-axis wall
+                        if valid_front_tof and self.front_tof_cm <= SEARCH_ADVANCE_SWEEP_WALL_CM:
+                            self._advance_sweep_obstacle = True
 
 
             
@@ -773,21 +843,36 @@ class TelloInterceptor:
             elif 0 < self.height_cm <= MIN_TRACKING_ALTITUDE_CM and ud < 0:
                 ud = 0  # Block descending below floor
 
-            # Forward Back Safety
+            # Forward Back Safety — stop at wall, no reverse (no rear ToF on Tello).
+            # Search-mode fb already clamped >=0 in advance state; intercept mode may still
+            # produce negative fb, which is allowed here (only forward push is wall-gated).
             if valid_front_tof:
                 if self.front_tof_cm <= FRONT_TOF_WALL_STOP_CM and fb > 0:
                     fb = 0
                     self.pitch_pid.reset_integral()
                     self.pitch_bbox_pid.reset_integral()
-                if mode_label == "searching":
-                    if self.front_tof_cm <= FRONT_TOF_WALL_BACKOFF_CM:
-                        fb = WALL_BACKOFF_VELOCITY_CM_S
-                        self.pitch_pid.reset_integral()
-                        self.pitch_bbox_pid.reset_integral()
-                    if FRONT_TOF_WALL_BACKOFF_CM < self.front_tof_cm and fb < 0:
-                        fb = 0
-                        self.pitch_pid.reset_integral()
-                        self.pitch_bbox_pid.reset_integral()
+
+            # Diagonal-wall mitigation: if front ToF just dropped from valid → -1, drone likely
+            # crossed past a wall edge (narrow cone now looking past it). Block forward fb until
+            # freeze window expires — gives drone time to either re-acquire wall or move clear.
+            if time.time() < self._front_tof_freeze_until and fb > 0:
+                fb = 0
+                self.pitch_pid.reset_integral()
+                self.pitch_bbox_pid.reset_integral()
+
+            # Shock freeze: IMU detected impact. Halt ALL axes + reset all PID integrals.
+            # Highest-priority safety — overrides every other axis decision above.
+            if time.time() < self._shock_freeze_until:
+                lr = 0
+                fb = 0
+                ud = 0
+                yaw = 0
+                self.pitch_pid.reset_integral()
+                self.pitch_bbox_pid.reset_integral()
+                self.altitude_pid.reset_integral()
+                self.altitude_target_pid.reset_integral()
+                self.yaw_pid.reset_integral()
+                self.roll_pid.reset_integral()
 
 
 
@@ -947,14 +1032,25 @@ class TelloInterceptor:
                     raw = self.tello.send_command_with_return("EXT tof?", timeout=1)
                 if raw and raw.strip().startswith("tof "):
                     mm = int(raw.strip().split()[1])
-                    self.front_tof_cm = -1.0 if mm >= 8190 else mm / 10.0
+                    new_front_tof_cm = -1.0 if mm >= 8190 else mm / 10.0
+                    # Discontinuity trigger: valid prev reading → -1 in single poll = likely past wall edge.
+                    # Freeze fb in safety block for FRONT_TOF_DISCONTINUITY_FREEZE_S to dodge diagonal crash.
+                    if self._front_tof_cm_prev > 0 and new_front_tof_cm == -1.0:
+                        self._front_tof_freeze_until = time.time() + FRONT_TOF_DISCONTINUITY_FREEZE_S
+                    self._front_tof_cm_prev = new_front_tof_cm
+                    self.front_tof_cm = new_front_tof_cm
 
                 # downward ToF + baro — read from state listener (no SDK command, no lock)
                 state = self.tello.get_current_state()
                 if state:
                     self.down_tof_cm = state.get("tof", -1)
+                    # Tello reports magic OOR value (often 6553) when down ToF out-of-range.
+                    # Treat anything >= 400 cm as invalid — indoor ceiling never that high,
+                    # and unfiltered spike pollutes height_cm → altitude PID saturates → drone slams down.
+                    if self.down_tof_cm >= 400:
+                        self.down_tof_cm = -1
                     baro_cm = state.get("h", -1)
-                 
+
                     if self.down_tof_cm > 0 and baro_cm > 0:
                         self.height_cm = max(self.down_tof_cm, baro_cm)
                     elif self.down_tof_cm > 0:
@@ -983,6 +1079,13 @@ class TelloInterceptor:
                     self.battery_percent = state.get("bat",  -1)
                     self.min_temp_C = state.get("templ",  -1)
                     self.max_temp_C = state.get("temph",  -1)
+
+                    # Shock detect: lateral / forward accel spike = impact. Freeze all axes
+                    # for IMU_SHOCK_FREEZE_S so drone stops bashing whatever it hit.
+                    if (abs(self.x_accel_cm_s2) > IMU_SHOCK_THRESHOLD_CM_S2
+                            or abs(self.y_accel_cm_s2) > IMU_SHOCK_THRESHOLD_CM_S2):
+                        self._shock_freeze_until = time.time() + IMU_SHOCK_FREEZE_S
+                        print(f"[WARN] IMU shock detected agx={self.x_accel_cm_s2} agy={self.y_accel_cm_s2} — freezing {IMU_SHOCK_FREEZE_S}s")
 
             except Exception:
                 pass
