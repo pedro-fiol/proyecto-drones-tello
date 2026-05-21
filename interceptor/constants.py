@@ -43,7 +43,7 @@ MIN_TRACKING_ALTITUDE_CM = 30   # floor clamp
 
 TARGET_LOST_GRACE_S = 2.0 # to avoid altitude PID flickering; longer = more time yawing toward last-seen side before full search FSM
 
-INTERCEPT_DISTANCE_CM       = 90
+INTERCEPT_DISTANCE_CM       = 95
 FRONT_TOF_MAX_RANGE_CM      = 120
 FRONT_TOF_WALL_STOP_CM      = 60
 
@@ -56,6 +56,11 @@ FRONT_TOF_DISCONTINUITY_FREEZE_S = 0.5
 # switching to bbox fallback. Stops ToF↔bbox flicker at edge of ToF range.
 FRONT_TOF_INVALID_HYSTERESIS_FRAMES = 3
 
+# Detection hysteresis: keep treating target as visible for N consecutive miss frames.
+# YOLO confidence dips below threshold for a single frame trigger grace/EMA reset →
+# yaw PID restarts on every dropout → constant oscillation. Hold last smoothed state instead.
+TRACKING_MISS_HYSTERESIS_FRAMES = 5
+
 
 # --- Search algorithm ---
 # Tello has no reliable XY odometry → no dead-reckoning. Advance ends via pitch_pid
@@ -67,11 +72,6 @@ SEARCH_MAX_CYCLES             = 3        # spin+advance cycles before hover_done
 SEARCH_ADVANCE_TOLERANCE_CM   = 15       # advance done when |INTERCEPT_DISTANCE_CM - front_tof_cm| < this
 SEARCH_ADVANCE_TIMEOUT_S      = 8.0      # bail if PID never settles (open space, ToF dropouts)
 SEARCH_OPEN_SPACE_VELOCITY_CM_S = 30     # fb when ToF out-of-range during advance (no obstacle yet → push forward until ToF acquires)
-
-# Sustained clearance gate: require N consecutive ToF=-1 frames before spin exits.
-# Validates direction is genuinely wide-open, not narrow gap between two walls aimed at wall behind.
-# 3 frames @ 30fps + 100 deg/s spin ≈ 10° of validated angular clearance.
-SEARCH_SPIN_CLEAR_FRAMES = 3
 
 # Advance distance cap: integrate fb*dt during advance. Force re-scan after this many cm.
 # Limits diagonal-wall crash damage range — drone never blindly pushes more than this without re-scanning.

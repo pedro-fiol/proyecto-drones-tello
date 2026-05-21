@@ -21,8 +21,8 @@ from .constants import (
     GRACE_RECOVERY_YAW_DEG_S, GRACE_RECOVERY_MIN_OFFSET_PX,
     TARGET_EMA_ALPHA, FB_MAX_VELOCITY_CM_S, FRAME_CENTER_X, FRAME_CENTER_Y,
     TARGET_LOST_GRACE_S, FRONT_TOF_WALL_STOP_CM, FRONT_TOF_DISCONTINUITY_FREEZE_S,
-    FRONT_TOF_INVALID_HYSTERESIS_FRAMES,
-    SEARCH_SPIN_CLEAR_FRAMES, SEARCH_ADVANCE_MAX_DISTANCE_CM,
+    FRONT_TOF_INVALID_HYSTERESIS_FRAMES, TRACKING_MISS_HYSTERESIS_FRAMES,
+    SEARCH_ADVANCE_MAX_DISTANCE_CM,
     SEARCH_ADVANCE_SWEEP_EVERY_S, SEARCH_ADVANCE_SWEEP_YAW_DEG_S,
     SEARCH_ADVANCE_SWEEP_ARC_DEG, SEARCH_ADVANCE_SWEEP_WALL_CM,
     IMU_SHOCK_THRESHOLD_CM_S2, IMU_SHOCK_FREEZE_S,
@@ -92,9 +92,9 @@ def _drain_keyboard_messages() -> None:
 
 
 
-""" 
-Use GPU if availible: run with ".\venv\Scripts\python.exe"
-"""
+
+# Use GPU if availible: run with ".\venv\Scripts\python.exe"
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[INFO] Using device: {DEVICE}")
 
@@ -162,6 +162,12 @@ class TelloInterceptor:
         self._closeness_smoothed: float = 0.0
         self._closeness_ema_initialized: bool = False
 
+        # EMA-smoothed bbox center + width — roll PID dead-zone gate must be stable.
+        # Raw bbox edges jitter per YOLO frame → frame_center flickers in/out → roll on-off-on-off.
+        self._bbox_center_x_smoothed: float = 0.0
+        self._bbox_width_smoothed: float = 0.0
+        self._bbox_ema_initialized: bool = False
+
         # Tracks last pitch PID source ("tof"|"bbox"|"none") to detect source switches.
         # On switch, the incoming PID's error_last is seeded with current error so the
         # first D-term doesn't spike off a stale error from a different unit system.
@@ -171,6 +177,10 @@ class TelloInterceptor:
         # mode (using last valid reading) until count exceeds threshold.
         self._tof_invalid_count: int = 0
         self._last_valid_front_tof_cm: float = -1.0
+
+        # Detection hysteresis: count consecutive frames target is missing.
+        # Keeps tracking_target True (using last smoothed values) for short YOLO dropouts.
+        self._tracking_miss_count: int = 0
 
         # Manual keyboard control
         self.is_manual: bool = False
@@ -212,8 +222,9 @@ class TelloInterceptor:
         self._front_tof_cm_prev: float = -1.0
         self._front_tof_freeze_until: float = 0.0
 
-        # Sustained clearance gate (H): N consecutive ToF=-1 frames in spin before exit.
-        self._search_spin_clear_count: int = 0
+        # Accumulated yaw angle during spin (deg). Spin exits when this reaches 360°
+        # — full rotation guarantees the camera has swept every direction at least once.
+        self._search_spin_angle_deg: float = 0.0
 
         # Advance sub-FSM (B + I): phases = "moving" | "sweeping". Distance cap + periodic sweep.
         self._advance_phase: str = "moving"
@@ -512,7 +523,19 @@ class TelloInterceptor:
 
             draw_wall_warning(current_frame, self.front_tof_cm)
 
-            tracking_target = tracking_target and target_y_px is not None and target_x_px is not None
+            tracking_target_raw = tracking_target and target_y_px is not None and target_x_px is not None
+
+            # Detection hysteresis: short YOLO confidence dips don't drop tracking_target.
+            # Within hysteresis window: keep tracking_target=True, hold last smoothed values.
+            if tracking_target_raw:
+                self._tracking_miss_count = 0
+                tracking_target = True
+            else:
+                self._tracking_miss_count += 1
+                tracking_target = (
+                    self._tracking_miss_count <= TRACKING_MISS_HYSTERESIS_FRAMES
+                    and self._target_ema_initialized
+                )
 
 
             """ 
@@ -547,33 +570,36 @@ class TelloInterceptor:
 
             # Target visible -> INTERCEPTING mode
             if tracking_target:
-                self._last_target_seen_time = time.time()
+                # Refresh only on raw detection so grace timer measures true loss duration.
+                if tracking_target_raw:
+                    self._last_target_seen_time = time.time()
                 mode_label = "intercepting"
 
                 # Reset Search if target re-acquired after loss
                 self._search_state = "none"
 
-                # Track which side target is on for edge-loss recovery (used in grace + search)
-                target_side = target_x_px - frame_center_x
-                if target_side > 0: # target on right side of frame
-                    self._last_target_side = 1
-                elif target_side < 0: # target on left side of frame
-                    self._last_target_side = -1
-                
-            
-                # EMA smooth target position to kill YOLO jitter before differentiating
-                if not self._target_ema_initialized:
-                    self._target_smoothed_x_px = float(target_x_px)
-                    self._target_smoothed_y_px = float(target_y_px)
-                    self._target_ema_initialized = True
-                else:
-                    self._target_smoothed_x_px = (TARGET_EMA_ALPHA * target_x_px +
-                                                  (1.0 - TARGET_EMA_ALPHA) * self._target_smoothed_x_px)
-                    self._target_smoothed_y_px = (TARGET_EMA_ALPHA * target_y_px +
-                                                  (1.0 - TARGET_EMA_ALPHA) * self._target_smoothed_y_px)
+                # Raw measurements only when YOLO returned a fresh detection this frame.
+                # Within hysteresis window (raw miss) we hold last smoothed values instead.
+                if tracking_target_raw:
+                    target_side = target_x_px - frame_center_x
+                    if target_side > 0:
+                        self._last_target_side = 1
+                    elif target_side < 0:
+                        self._last_target_side = -1
+
+                    # EMA smooth target position to kill YOLO jitter before differentiating
+                    if not self._target_ema_initialized:
+                        self._target_smoothed_x_px = float(target_x_px)
+                        self._target_smoothed_y_px = float(target_y_px)
+                        self._target_ema_initialized = True
+                    else:
+                        self._target_smoothed_x_px = (TARGET_EMA_ALPHA * target_x_px +
+                                                      (1.0 - TARGET_EMA_ALPHA) * self._target_smoothed_x_px)
+                        self._target_smoothed_y_px = (TARGET_EMA_ALPHA * target_y_px +
+                                                      (1.0 - TARGET_EMA_ALPHA) * self._target_smoothed_y_px)
 
                 # EMA-smooth closeness same way (bbox PID consumes it when ToF fallback fires)
-                if tracked_person is not None and TARGET.is_visible(tracked_person):
+                if tracking_target_raw and tracked_person is not None and TARGET.is_visible(tracked_person):
                     raw_closeness = TARGET.closeness(tracked_person)
                     if not self._closeness_ema_initialized:
                         self._closeness_smoothed = float(raw_closeness)
@@ -581,6 +607,24 @@ class TelloInterceptor:
                     else:
                         self._closeness_smoothed = (TARGET_EMA_ALPHA * raw_closeness +
                                                     (1.0 - TARGET_EMA_ALPHA) * self._closeness_smoothed)
+
+                # EMA-smooth bbox center + width — roll PID dead-zone needs stable edges
+                if tracking_target_raw and tracked_person is not None:
+                    raw_center = float(tracked_person.bbox_center_x)
+                    raw_width = float(tracked_person.bbox_width_pixels)
+                    if not self._bbox_ema_initialized:
+                        self._bbox_center_x_smoothed = raw_center
+                        self._bbox_width_smoothed = raw_width
+                        self._bbox_ema_initialized = True
+                    else:
+                        self._bbox_center_x_smoothed = (TARGET_EMA_ALPHA * raw_center +
+                                                       (1.0 - TARGET_EMA_ALPHA) * self._bbox_center_x_smoothed)
+                        self._bbox_width_smoothed = (TARGET_EMA_ALPHA * raw_width +
+                                                    (1.0 - TARGET_EMA_ALPHA) * self._bbox_width_smoothed)
+
+                # Expose smoothed closeness for logging regardless of pitch source
+                if self._closeness_ema_initialized:
+                    closeness_value = self._closeness_smoothed
 
 
                 # --- Target Altitude PID ---
@@ -603,9 +647,20 @@ class TelloInterceptor:
                 else:
                     self._tof_invalid_count += 1
 
+
+
+
+
+
+
+
+
+                # revisar desde aquí
+
                 if self._last_valid_front_tof_cm > 0 and self._tof_invalid_count < FRONT_TOF_INVALID_HYSTERESIS_FRAMES:
                     pitch_source = "tof"
-                    error_pitch = INTERCEPT_DISTANCE_CM - self._last_valid_front_tof_cm
+                    front_tof_for_pid = self.front_tof_cm if valid_front_tof else self._last_valid_front_tof_cm
+                    error_pitch = INTERCEPT_DISTANCE_CM - front_tof_for_pid
 
                     # Switching INTO ToF: seed error_last so D-term doesn't spike off stale ratio-unit err.
                     if self._pitch_source_last != "tof":
@@ -616,13 +671,22 @@ class TelloInterceptor:
 
                 elif self._closeness_ema_initialized:
                     closeness_value = self._closeness_smoothed
-                    pitch_source = "bbox"
-                    error_pitch = TARGET.closeness_setpoint - closeness_value
-                    # Switching INTO bbox: seed error_last to avoid D-spike off stale cm-unit err.
-                    if self._pitch_source_last != "bbox":
-                        self.pitch_bbox_pid.error_last = error_pitch
-                    fb = self.pitch_bbox_pid.compute(error_pitch, RC_LOOP_INTERVAL_S)
-                    self.pitch_pid.reset_integral()
+                    # Forward-only: drone has no rear ToF → blind reverse = crash.
+                    # Only push forward when too far (closeness < setpoint); clamp fb=0 when close enough.
+                    if closeness_value < TARGET.closeness_setpoint:
+                        pitch_source = "bbox"
+                        error_pitch = TARGET.closeness_setpoint - closeness_value
+                        # Switching INTO bbox: seed error_last to avoid D-spike off stale cm-unit err.
+                        if self._pitch_source_last != "bbox":
+                            self.pitch_bbox_pid.error_last = error_pitch
+                        fb = self.pitch_bbox_pid.compute(error_pitch, RC_LOOP_INTERVAL_S)
+                        self.pitch_pid.reset_integral()
+                    else:
+                        pitch_source = "none"
+                        error_pitch = 0.0
+                        fb = 0.0
+                        self.pitch_pid.reset_integral()
+                        self.pitch_bbox_pid.reset_integral()
 
                 else:
                     pitch_source = "none"
@@ -633,11 +697,12 @@ class TelloInterceptor:
 
 
                 #--- Roll PID ---
-                bbox_half = tracked_person.bbox_width_pixels / 2
-                bbox_left  = tracked_person.bbox_center_x - bbox_half
-                bbox_right = tracked_person.bbox_center_x + bbox_half
-                roll_bbox_left = float(bbox_left)
-                roll_bbox_right = float(bbox_right)
+                # Use EMA-smoothed bbox so dead-zone edges don't flicker per YOLO frame.
+                bbox_half = self._bbox_width_smoothed / 2
+                bbox_left  = self._bbox_center_x_smoothed - bbox_half
+                bbox_right = self._bbox_center_x_smoothed + bbox_half
+                roll_bbox_left = bbox_left
+                roll_bbox_right = bbox_right
 
                 if bbox_left <= frame_center_x <= bbox_right:
                     lr = 0
@@ -675,9 +740,10 @@ class TelloInterceptor:
                 self.pitch_pid.reset_integral()
                 self.pitch_bbox_pid.reset_integral()
 
-                # EMA — next target = fresh start for both position + closeness
+                # EMA — next target = fresh start for both position + closeness + bbox
                 self._target_ema_initialized = False
                 self._closeness_ema_initialized = False
+                self._bbox_ema_initialized = False
 
 
             # target not visible and not in grace -> searching mode
@@ -689,11 +755,13 @@ class TelloInterceptor:
                 self.altitude_target_pid.reset_integral()
                 self._target_ema_initialized = False
                 self._closeness_ema_initialized = False
+                self._bbox_ema_initialized = False
                 ud = self.altitude_pid.compute(error_altitude, RC_LOOP_INTERVAL_S)
 
-                # roll, pitch bbox — not active during search
+                # roll, pitch bbox, yaw — not active during search; reset integrals to avoid wind-up carry-over
                 self.roll_pid.reset_integral()
                 self.pitch_bbox_pid.reset_integral()
+                self.yaw_pid.reset_integral()
                 error_yaw = 0.0
                 error_pitch = 0.0
                 pitch_source = "none"
@@ -703,6 +771,7 @@ class TelloInterceptor:
                 if self._search_state == "none":
                     self._search_state = "spin"
                     self._search_sub_state_t0 = time.time()
+                    self._search_spin_angle_deg = 0.0
 
                 if self._search_state == "spin":
                     # First spin direction = last-seen side (target most likely there).
@@ -711,14 +780,11 @@ class TelloInterceptor:
                     yaw = spin_sign * SEARCH_SPIN_VELOCITY_DEG_S
                     fb  = 0.0
 
-                    # Sustained clearance gate: require N consecutive ToF=-1 frames before exit.
-                    # Validates clear direction is genuinely wide-open (not narrow gap aimed at wall).
-                    if self.front_tof_cm == -1.0:
-                        self._search_spin_clear_count += 1
-                    else:
-                        self._search_spin_clear_count = 0
+                    # Accumulate spin angle. Full 360° guarantees camera swept every
+                    # direction → maximizes chance of re-acquiring target before advancing.
+                    self._search_spin_angle_deg += SEARCH_SPIN_VELOCITY_DEG_S * RC_LOOP_INTERVAL_S
 
-                    if self._search_spin_clear_count >= SEARCH_SPIN_CLEAR_FRAMES:
+                    if self._search_spin_angle_deg >= 360.0:
                         yaw = 0.0
                         self._search_state = "advance"
                         self._search_sub_state_t0 = time.time()
@@ -761,7 +827,7 @@ class TelloInterceptor:
                         if settled or timed_out or distance_capped:
                             self._search_state = "spin"
                             self._search_sub_state_t0 = now
-                            self._search_spin_clear_count = 0
+                            self._search_spin_angle_deg = 0.0
                         elif now - self._advance_last_sweep_t >= SEARCH_ADVANCE_SWEEP_EVERY_S:
                             self._advance_phase = "sweeping"
                             self._advance_phase_t0 = now
@@ -786,7 +852,7 @@ class TelloInterceptor:
                                 # Diagonal wall detected during sweep → abort advance, re-spin
                                 self._search_state = "spin"
                                 self._search_sub_state_t0 = now
-                                self._search_spin_clear_count = 0
+                                self._search_spin_angle_deg = 0.0
                             else:
                                 self._advance_phase = "moving"
                                 self._advance_last_sweep_t = now
