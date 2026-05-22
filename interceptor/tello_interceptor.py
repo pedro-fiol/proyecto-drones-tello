@@ -7,6 +7,7 @@ import torch
 import threading
 import time
 import logging
+from typing import Optional
 
 from djitellopy import Tello, TelloException
 from .pid_controller import PIDController
@@ -25,7 +26,6 @@ from .constants import (
     SEARCH_ADVANCE_MAX_DISTANCE_CM,
     SEARCH_ADVANCE_SWEEP_EVERY_S, SEARCH_ADVANCE_SWEEP_YAW_DEG_S,
     SEARCH_ADVANCE_SWEEP_ARC_DEG, SEARCH_ADVANCE_SWEEP_WALL_CM,
-    IMU_SHOCK_THRESHOLD_CM_S2, IMU_SHOCK_FREEZE_S,
     GAINS_ALTITUDE_PID, GAINS_ALTITUDE_TARGET_PID,
     GAINS_FORWARD_BACK_TOF_PID, GAINS_FORWARD_BACK_BBOX_PID, GAINS_YAW_PID,
     INTERCEPT_DISTANCE_CM,
@@ -42,6 +42,7 @@ from .hud_overlay import (
     draw_target_y_line,
     draw_frame_crosshair,
     draw_person_overlays,
+    draw_all_track_labels,
     draw_phantom_badge,
     draw_telemetry_strip,
     draw_wall_warning,
@@ -62,6 +63,7 @@ _user32 = ctypes.windll.user32
 _VK_W, _VK_S, _VK_A, _VK_D, _VK_Q, _VK_E = 0x57, 0x53, 0x41, 0x44, 0x51, 0x45
 _VK_UP, _VK_DOWN = 0x26, 0x28
 _VK_SPACE, _VK_M, _VK_ESC = 0x20, 0x4D, 0x1B
+_VK_I, _VK_C = 0x49, 0x43
 
 
 def _is_key_pressed(vk: int) -> bool:
@@ -156,6 +158,12 @@ class TelloInterceptor:
         self._target_smoothed_y_px: float = 0.0
         self._target_ema_initialized: bool = False
 
+        # Single-person identity lock via BoT-SORT track id. Set during pre-takeoff
+        # enrollment (press 'i' on the OpenCV window). When set, select_best_person
+        # only returns detections with this id — drone refuses to swap onto strangers.
+        # Lock survives across hover/search modes. Manually re-set via 'i' if track lost.
+        self._locked_track_id: Optional[int] = None
+
         # EMA-smoothed closeness signal for bbox pitch PID. Same TARGET_EMA_ALPHA as
         # target x/y — closeness is computed from raw detection, jitters per frame.
         # Without smoothing, Kd term spikes on YOLO noise and produces twitchy fb.
@@ -191,10 +199,14 @@ class TelloInterceptor:
         self._space_was_pressed: bool = False
         self._m_was_pressed: bool = False
         self._esc_was_pressed: bool = False
+        self._i_was_pressed: bool = False
+        self._c_was_pressed: bool = False
 
         self._space_rising_edge: bool = False
         self._m_rising_edge: bool = False
         self._esc_rising_edge: bool = False
+        self._i_rising_edge: bool = False
+        self._c_rising_edge: bool = False
 
         self._is_airborne: bool = False
         self._is_toggling_flight: bool = False
@@ -232,12 +244,6 @@ class TelloInterceptor:
         self._advance_last_sweep_t: float = 0.0
         self._advance_distance_cm: float = 0.0
         self._advance_sweep_obstacle: bool = False
-
-        # Shock detect (D): IMU accel spike → freeze all axes for IMU_SHOCK_FREEZE_S.
-        # Set in telemetry thread, checked in safety block.
-        self._shock_freeze_until: float = 0.0
-
-
 
     """
     Starts drone connection, video stream, and all threads.
@@ -497,16 +503,25 @@ class TelloInterceptor:
             # someone), select nearest-to-last detection. EMA gets cleared in hover/search
             # branches → next acquire falls back to largest-bbox. This pins identity for
             # the duration of a continuous track and re-locks cleanly after a true loss.
+            #
+            # locked_track_id (set via enrollment, key 'i') is the strongest constraint —
+            # overrides nearest/largest and only matches the enrolled BoT-SORT id.
             last_point_px = (
                 (self._target_smoothed_x_px, self._target_smoothed_y_px)
                 if self._target_ema_initialized else None
             )
-            best_person = select_best_person(detected_persons, TARGET, last_point_px)
+            best_person = select_best_person(
+                detected_persons, TARGET, last_point_px, self._locked_track_id
+            )
             persons_to_draw = [best_person] if best_person is not None else []
 
             """
             HUD overlays
             """
+            # Draw track id + rank on every detected person first so labels sit
+            # under the highlighted target box drawn next.
+            draw_all_track_labels(current_frame, detected_persons, self._locked_track_id)
+
             target_x_px, target_y_px, tracking_target, tracked_person = draw_person_overlays(
                 current_frame, persons_to_draw, TARGET
             )
@@ -914,22 +929,6 @@ class TelloInterceptor:
                 self.pitch_pid.reset_integral()
                 self.pitch_bbox_pid.reset_integral()
 
-            # Shock freeze: IMU detected impact. Halt ALL axes + reset all PID integrals.
-            # Highest-priority safety — overrides every other axis decision above.
-            if time.time() < self._shock_freeze_until:
-                lr = 0
-                fb = 0
-                ud = 0
-                yaw = 0
-                self.pitch_pid.reset_integral()
-                self.pitch_bbox_pid.reset_integral()
-                self.altitude_pid.reset_integral()
-                self.altitude_target_pid.reset_integral()
-                self.yaw_pid.reset_integral()
-                self.roll_pid.reset_integral()
-
-
-
             self.rc[0] = int(round(lr))
             self.rc[1] = int(round(fb))
             self.rc[2] = int(round(ud))
@@ -1039,6 +1038,29 @@ class TelloInterceptor:
                 self.pitch_bbox_pid.reset_integral()
                 self.roll_pid.reset_integral()
 
+            # I — enroll / cycle. Sort detections by bbox area desc. If no lock or
+            # locked id missing this frame, lock rank 1 (largest). Else advance to
+            # the next rank, wrapping to 1 after the last. Visual rank shown on HUD.
+            if self._i_rising_edge:
+                with_id = [p for p in detected_persons if p.track_id is not None]
+                if not with_id:
+                    print("[ENROLL] No detections with track_id — nothing to lock.")
+                else:
+                    sorted_persons = sorted(with_id, key=lambda p: p.bbox_area_pixels, reverse=True)
+                    ids_sorted = [p.track_id for p in sorted_persons]
+                    if self._locked_track_id not in ids_sorted:
+                        new_id = ids_sorted[0]
+                    else:
+                        current_index = ids_sorted.index(self._locked_track_id)
+                        new_id = ids_sorted[(current_index + 1) % len(ids_sorted)]
+                    self._locked_track_id = new_id
+                    print(f"[ENROLL] Locked track_id={new_id} (rank {ids_sorted.index(new_id) + 1}/{len(ids_sorted)})")
+
+            # C — clear lock. Drone falls back to nearest/largest selection.
+            if self._c_rising_edge:
+                self._locked_track_id = None
+                print("[ENROLL] Lock cleared.")
+
         cv2.destroyAllWindows()
 
     def _poll_keyboard(self) -> None:
@@ -1047,14 +1069,20 @@ class TelloInterceptor:
         space_now = _is_key_pressed(_VK_SPACE)
         m_now     = _is_key_pressed(_VK_M)
         esc_now   = _is_key_pressed(_VK_ESC)
+        i_now     = _is_key_pressed(_VK_I)
+        c_now     = _is_key_pressed(_VK_C)
 
         self._space_rising_edge = space_now and not self._space_was_pressed
         self._m_rising_edge     = m_now     and not self._m_was_pressed
         self._esc_rising_edge   = esc_now   and not self._esc_was_pressed
+        self._i_rising_edge     = i_now     and not self._i_was_pressed
+        self._c_rising_edge     = c_now     and not self._c_was_pressed
 
         self._space_was_pressed = space_now
         self._m_was_pressed     = m_now
         self._esc_was_pressed   = esc_now
+        self._i_was_pressed     = i_now
+        self._c_was_pressed     = c_now
 
         if not self.is_manual:
             self.manual_lr = self.manual_fb = self.manual_ud = self.manual_yaw = 0
@@ -1133,13 +1161,6 @@ class TelloInterceptor:
                     self.battery_percent = state.get("bat",  -1)
                     self.min_temp_C = state.get("templ",  -1)
                     self.max_temp_C = state.get("temph",  -1)
-
-                    # Shock detect: lateral / forward accel spike = impact. Freeze all axes
-                    # for IMU_SHOCK_FREEZE_S so drone stops bashing whatever it hit.
-                    if (abs(self.x_accel_cm_s2) > IMU_SHOCK_THRESHOLD_CM_S2
-                            or abs(self.y_accel_cm_s2) > IMU_SHOCK_THRESHOLD_CM_S2):
-                        self._shock_freeze_until = time.time() + IMU_SHOCK_FREEZE_S
-                        print(f"[WARN] IMU shock detected agx={self.x_accel_cm_s2} agy={self.y_accel_cm_s2} — freezing {IMU_SHOCK_FREEZE_S}s")
 
             except Exception:
                 pass

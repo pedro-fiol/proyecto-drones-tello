@@ -84,12 +84,6 @@ SEARCH_ADVANCE_SWEEP_YAW_DEG_S  = 50    # yaw rate during sweep (gentler than sp
 SEARCH_ADVANCE_SWEEP_ARC_DEG    = 20    # sweep amplitude ± around current heading
 SEARCH_ADVANCE_SWEEP_WALL_CM    = 80    # any ToF reading <= this during sweep = diagonal wall detected
 
-# IMU shock detect: lateral accel spike = impact. Freeze all axes briefly + reset PIDs.
-# Threshold in raw Tello accel units (likely cm/s² or 0.001g — both interpretations make 800 ≈ 0.8g).
-# Tune down if never fires.
-IMU_SHOCK_THRESHOLD_CM_S2 = 800
-IMU_SHOCK_FREEZE_S        = 2.0
-
 # Grace-period yaw recovery: when target lost off-edge, yaw toward last-seen side
 GRACE_RECOVERY_YAW_DEG_S      = 60       # yaw rate during grace toward last-seen side
 GRACE_RECOVERY_MIN_OFFSET_PX  = 100      # only trigger if target was that far off-center when lost

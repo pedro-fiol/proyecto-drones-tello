@@ -197,23 +197,33 @@ def select_best_person(
     persons: list[Person],
     target: "Target",
     last_point_px: tuple[float, float] | None = None,
+    locked_track_id: int | None = None,
 ) -> "Person | None":
     """Pick a single Person to track from a list of detections.
 
-    Single-target lock policy: if last_point_px provided (drone is currently
-    tracking someone), pick the detection whose target point is nearest in
-    pixels to that prior position. Prevents identity swap when a second person
-    enters frame with a larger bbox. If no prior lock (last_point_px=None) or
-    the visible pool is empty, fall back to largest-bbox selection.
+    Identity priority:
+        1. locked_track_id set → only detections with that track_id are eligible.
+           If none match this frame → return None (target invisible this frame).
+        2. last_point_px given AND visible pool non-empty → nearest in pixels.
+        3. Else among visible — largest bbox area wins.
+        4. Else among all — largest bbox area wins (proxy for "closest").
+        5. Empty list → None.
 
-    Selection priority:
-        1. last_point_px given AND visible pool non-empty → nearest in pixels.
-        2. Else among visible — largest bbox area wins.
-        3. Else among all — largest bbox area wins (proxy for "closest").
-        4. Empty list → None.
+    locked_track_id is the strongest constraint. When set (post-enrollment) the
+    drone refuses to swap onto any other person regardless of bbox size, distance
+    to prior centroid, or visibility class. Caller decides when to drop the lock
+    (e.g. on prolonged invisibility).
     """
     if not persons:
         return None
+
+    if locked_track_id is not None:
+        locked = [p for p in persons if p.track_id == locked_track_id]
+        if not locked:
+            return None
+        visible_locked = [p for p in locked if target.is_visible(p)]
+        pool = visible_locked if visible_locked else locked
+        return max(pool, key=lambda p: p.bbox_area_pixels)
 
     visible = [p for p in persons if target.is_visible(p)]
     pool = visible if visible else persons

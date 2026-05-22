@@ -57,6 +57,10 @@ class Person:
     x2: int
     y2: int
     bbox_confidence: float
+    # BoT-SORT tracking ID. None if tracker disabled or detection has no track
+    # this frame (just appeared / re-identified). Used for single-person identity
+    # lock — orchestrator stores a locked id at enrollment and filters detections.
+    track_id: Optional[int] = None
     nose: Optional[Keypoint] = None
     left_eye: Optional[Keypoint] = None
     right_eye: Optional[Keypoint] = None
@@ -123,11 +127,19 @@ class PersonDetector:
         self.model.to(self.device)
 
     def detect_persons_in_frame(self, frame) -> list[Person]:
-        """Run inference on one BGR frame and return all detected persons."""
-        results = self.model(
+        """Run BoT-SORT tracking on one BGR frame and return tracked persons.
+
+        Uses model.track(persist=True) so IDs survive across frames. IDs only
+        valid for the lifetime of this PersonDetector instance — recreating the
+        detector resets the tracker counter. Detections without an ID this frame
+        (just-appeared) get track_id=None.
+        """
+        results = self.model.track(
             frame,
             classes=[YOLO_PERSON_CLASS_ID],
             conf=YOLO_CONFIDENCE_MIN,
+            persist=True,
+            tracker="botsort.yaml",
             verbose=False,
         )
         persons: list[Person] = []
@@ -141,12 +153,19 @@ class PersonDetector:
             return persons
         for index, box in enumerate(result.boxes):
             x1, y1, x2, y2 = map(int, box.xyxy[0])
+            track_id: Optional[int] = None
+            if box.id is not None:
+                try:
+                    track_id = int(box.id[0])
+                except (IndexError, TypeError):
+                    track_id = None
             person = Person(
                 x1=x1,
                 y1=y1,
                 x2=x2,
                 y2=y2,
                 bbox_confidence=float(box.conf[0]),
+                track_id=track_id,
             )
             self._attach_keypoints_to_person(person, result, index)
             persons.append(person)
