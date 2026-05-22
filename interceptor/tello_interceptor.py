@@ -493,8 +493,15 @@ class TelloInterceptor:
             if frame_count % YOLO_FRAME_STRIDE == 0:
                 detected_persons = self.person_detector.detect_persons_in_frame(current_frame)
 
-            # work in progress
-            best_person = select_best_person(detected_persons, TARGET)
+            # Single-person lock: while EMA initialized (drone is currently tracking
+            # someone), select nearest-to-last detection. EMA gets cleared in hover/search
+            # branches → next acquire falls back to largest-bbox. This pins identity for
+            # the duration of a continuous track and re-locks cleanly after a true loss.
+            last_point_px = (
+                (self._target_smoothed_x_px, self._target_smoothed_y_px)
+                if self._target_ema_initialized else None
+            )
+            best_person = select_best_person(detected_persons, TARGET, last_point_px)
             persons_to_draw = [best_person] if best_person is not None else []
 
             """
@@ -626,7 +633,6 @@ class TelloInterceptor:
                 if self._closeness_ema_initialized:
                     closeness_value = self._closeness_smoothed
 
-
                 # --- Target Altitude PID ---
                 # All errors use convention: error = target - measurement, then adjust gains sign accordingly
                 error_altitude = self._target_smoothed_y_px - target_setpoint_y_px
@@ -647,16 +653,7 @@ class TelloInterceptor:
                 else:
                     self._tof_invalid_count += 1
 
-
-
-
-
-
-
-
-
                 # revisar desde aquí
-
                 if self._last_valid_front_tof_cm > 0 and self._tof_invalid_count < FRONT_TOF_INVALID_HYSTERESIS_FRAMES:
                     pitch_source = "tof"
                     front_tof_for_pid = self.front_tof_cm if valid_front_tof else self._last_valid_front_tof_cm
@@ -670,23 +667,14 @@ class TelloInterceptor:
                     self.pitch_bbox_pid.reset_integral()
 
                 elif self._closeness_ema_initialized:
+                    pitch_source = "bbox"
                     closeness_value = self._closeness_smoothed
-                    # Forward-only: drone has no rear ToF → blind reverse = crash.
-                    # Only push forward when too far (closeness < setpoint); clamp fb=0 when close enough.
-                    if closeness_value < TARGET.closeness_setpoint:
-                        pitch_source = "bbox"
-                        error_pitch = TARGET.closeness_setpoint - closeness_value
-                        # Switching INTO bbox: seed error_last to avoid D-spike off stale cm-unit err.
-                        if self._pitch_source_last != "bbox":
-                            self.pitch_bbox_pid.error_last = error_pitch
-                        fb = self.pitch_bbox_pid.compute(error_pitch, RC_LOOP_INTERVAL_S)
-                        self.pitch_pid.reset_integral()
-                    else:
-                        pitch_source = "none"
-                        error_pitch = 0.0
-                        fb = 0.0
-                        self.pitch_pid.reset_integral()
-                        self.pitch_bbox_pid.reset_integral()
+                    error_pitch = TARGET.closeness_setpoint - closeness_value
+                    # Switching INTO bbox: seed error_last to avoid D-spike off stale cm-unit err.
+                    if self._pitch_source_last != "bbox":
+                        self.pitch_bbox_pid.error_last = error_pitch
+                    fb = self.pitch_bbox_pid.compute(error_pitch, RC_LOOP_INTERVAL_S)
+                    self.pitch_pid.reset_integral()
 
                 else:
                     pitch_source = "none"

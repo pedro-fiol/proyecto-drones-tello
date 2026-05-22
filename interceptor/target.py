@@ -193,27 +193,38 @@ BBOX_CENTER_TARGET = Target(
 # Single-person selection
 # ---------------------------------------------------------------------------
 
-def select_best_person(persons: list[Person], target: "Target") -> "Person | None":
+def select_best_person(
+    persons: list[Person],
+    target: "Target",
+    last_point_px: tuple[float, float] | None = None,
+) -> "Person | None":
     """Pick a single Person to track from a list of detections.
 
-    Phase 6a is single-target by spec. YOLO occasionally returns spurious
-    second detections (posters, reflections, low-conf body bboxes) that flicker
-    on/off and clutter the HUD. This filter guarantees one bbox at a time.
+    Single-target lock policy: if last_point_px provided (drone is currently
+    tracking someone), pick the detection whose target point is nearest in
+    pixels to that prior position. Prevents identity swap when a second person
+    enters frame with a larger bbox. If no prior lock (last_point_px=None) or
+    the visible pool is empty, fall back to largest-bbox selection.
 
     Selection priority:
-        1. Among persons that pass target.is_visible — largest bbox area wins.
-        2. Else among all persons — largest bbox area wins (proxy for "closest").
-        3. Empty list → None.
-
-    Largest area is preferred over highest confidence because a closer person
-    almost always has both a bigger bbox AND higher pose-keypoint confidence;
-    area is the more stable signal at the frame-to-frame level.
+        1. last_point_px given AND visible pool non-empty → nearest in pixels.
+        2. Else among visible — largest bbox area wins.
+        3. Else among all — largest bbox area wins (proxy for "closest").
+        4. Empty list → None.
     """
     if not persons:
         return None
 
     visible = [p for p in persons if target.is_visible(p)]
     pool = visible if visible else persons
+
+    if last_point_px is not None and visible:
+        last_x, last_y = last_point_px
+        def _dist_sq(p: Person) -> float:
+            px, py = target.point(p)
+            return (px - last_x) ** 2 + (py - last_y) ** 2
+        return min(visible, key=_dist_sq)
+
     return max(pool, key=lambda p: p.bbox_area_pixels)
 
 

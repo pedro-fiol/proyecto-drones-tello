@@ -31,10 +31,10 @@ YAW_MAX_VELOCITY_CM_S = 50
 FB_MAX_VELOCITY_CM_S = 100
 LR_MAX_VELOCITY_CM_S = 60
 
-MANUAL_FB_VELOCITY_CM_S    = 30
-MANUAL_LR_VELOCITY_CM_S    = 60
-MANUAL_UD_VELOCITY_CM_S    = 60
-MANUAL_YAW_VELOCITY_DEG_S  = 60
+MANUAL_FB_VELOCITY_CM_S    = 80
+MANUAL_LR_VELOCITY_CM_S    = 80
+MANUAL_UD_VELOCITY_CM_S    = 80
+MANUAL_YAW_VELOCITY_DEG_S  = 80
 
 # ---- Target tracking ----
 TARGET_ALTITUDE_CM       = 150
@@ -59,13 +59,13 @@ FRONT_TOF_INVALID_HYSTERESIS_FRAMES = 3
 # Detection hysteresis: keep treating target as visible for N consecutive miss frames.
 # YOLO confidence dips below threshold for a single frame trigger grace/EMA reset →
 # yaw PID restarts on every dropout → constant oscillation. Hold last smoothed state instead.
-TRACKING_MISS_HYSTERESIS_FRAMES = 5
+TRACKING_MISS_HYSTERESIS_FRAMES = 15
 
 
 # --- Search algorithm ---
 # Tello has no reliable XY odometry → no dead-reckoning. Advance ends via pitch_pid
 # settling on INTERCEPT_DISTANCE_CM. Budget tracked in cycles, not cm.
-SEARCH_SPIN_VELOCITY_DEG_S    = 100
+SEARCH_SPIN_VELOCITY_DEG_S    = 40
 SEARCH_YAW_TOLERANCE_DEG      = 5
 SEARCH_SAMPLE_EVERY_DEG       = 10       # min yaw delta between direction samples during spin
 SEARCH_MAX_CYCLES             = 3        # spin+advance cycles before hover_done
@@ -102,7 +102,7 @@ GAINS_ALTITUDE_PID          = (1.4, 0.04, 0.08)         # cm error  → ud  (bar
 GAINS_ALTITUDE_TARGET_PID   = (-0.15, -0.004, -0.08)    # px error  → ud  (image-y inverted vs world-up)
 GAINS_YAW_PID               = (0.2, 0.003, 0.1)       # px error  → yaw
 GAINS_FORWARD_BACK_TOF_PID = (-0.85, -0.02, -0.42)   # cm error → fb
-GAINS_FORWARD_BACK_BBOX_PID = (400, 0.0, 60.0)   # ratio err → fb
+GAINS_FORWARD_BACK_BBOX_PID = (200, 0.0, 20.0)   # ratio err → fb
 GAINS_LEFT_RIGHT_PID        = (0.2, 0.01, 0.15)   # px error  → lr
 
 """
@@ -144,7 +144,7 @@ RC_LOOP_INTERVAL_S          = 0.05   # 20 Hz
 #
 # The active TARGET selection lives in interceptor/target.py to avoid circular imports.
 BBOX_HEIGHT_RATIO_SETPOINT     = 0.75
-BBOX_WIDTH_RATIO_SETPOINT      = 0.35
+BBOX_WIDTH_RATIO_SETPOINT      = 0.4
 SHOULDER_WIDTH_RATIO_SETPOINT  = 0.35
 
 
