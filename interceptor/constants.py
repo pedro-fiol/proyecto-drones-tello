@@ -41,7 +41,12 @@ TARGET_ALTITUDE_CM       = 150
 MAX_TRACKING_ALTITUDE_CM = 180   # ceiling clamp 
 MIN_TRACKING_ALTITUDE_CM = 30   # floor clamp 
 
-TARGET_LOST_GRACE_S = 2.0 # to avoid altitude PID flickering; longer = more time yawing toward last-seen side before full search FSM
+TARGET_LOST_GRACE_S = 4.0 # to avoid altitude PID flickering; longer = more time yawing toward last-seen side before full search FSM
+
+# Drop _locked_track_id after this many consecutive seconds of no detection
+# matching the locked id. BoT-SORT reassigns ids after re-id failures; without
+# auto-clear the lock becomes permanent dead-lock and drone never re-tracks.
+LOCK_LOST_TIMEOUT_S = 3.0
 
 INTERCEPT_DISTANCE_CM       = 95
 FRONT_TOF_MAX_RANGE_CM      = 120
@@ -59,13 +64,13 @@ FRONT_TOF_INVALID_HYSTERESIS_FRAMES = 3
 # Detection hysteresis: keep treating target as visible for N consecutive miss frames.
 # YOLO confidence dips below threshold for a single frame trigger grace/EMA reset →
 # yaw PID restarts on every dropout → constant oscillation. Hold last smoothed state instead.
-TRACKING_MISS_HYSTERESIS_FRAMES = 15
+TRACKING_MISS_HYSTERESIS_FRAMES = 45
 
 
 # --- Search algorithm ---
 # Tello has no reliable XY odometry → no dead-reckoning. Advance ends via pitch_pid
 # settling on INTERCEPT_DISTANCE_CM. Budget tracked in cycles, not cm.
-SEARCH_SPIN_VELOCITY_DEG_S    = 40
+SEARCH_SPIN_VELOCITY_DEG_S    = 50
 SEARCH_YAW_TOLERANCE_DEG      = 5
 SEARCH_SAMPLE_EVERY_DEG       = 10       # min yaw delta between direction samples during spin
 SEARCH_MAX_CYCLES             = 3        # spin+advance cycles before hover_done
@@ -119,6 +124,14 @@ ERROR_HOVER_TIMEOUT_S       = 5
 # ---- RC loop ----
 RC_LOOP_INTERVAL_S          = 0.05   # 20 Hz
 
+# ---- Webapp manual control ----
+# Heartbeat grace for the browser dpad. Each /cmd/manual_set call refreshes
+# the deadline; if the browser tab dies or network drops, manual_* zero within
+# this many seconds and the drone holds position (Tello baro + optical-flow).
+# Long enough to absorb a missed 100 ms heartbeat, short enough that runaway
+# motion stops fast.
+WEB_MANUAL_HEARTBEAT_GRACE_S = 0.6
+
 
 # ---- Target tracking (Phase 6a) ----
 # Closeness setpoints used by the pitch fallback PID when front ToF is invalid.
@@ -137,8 +150,8 @@ RC_LOOP_INTERVAL_S          = 0.05   # 20 Hz
 # SHOULDER_WIDTH_RATIO_SETPOINT — kept for reference / fallback.
 #
 # The active TARGET selection lives in interceptor/target.py to avoid circular imports.
-BBOX_HEIGHT_RATIO_SETPOINT     = 0.75
-BBOX_WIDTH_RATIO_SETPOINT      = 0.4
+BBOX_HEIGHT_RATIO_SETPOINT     = 1
+BBOX_WIDTH_RATIO_SETPOINT      = 0.45
 SHOULDER_WIDTH_RATIO_SETPOINT  = 0.35
 
 

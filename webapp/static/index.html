@@ -1,0 +1,1594 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Tello — Operator Console</title>
+<meta name="viewport" content="width=1280" />
+<style>
+  /* ---------- Tokens ---------- */
+  :root {
+    --bg:        #ececee;
+    --bg-2:      #e3e3e6;
+    --surface:   #ffffff;
+    --surface-2: #f6f6f7;
+    --line:      #e3e3e6;
+    --line-2:    #d6d6da;
+    --ink:       #0b0b0d;
+    --ink-2:     #4a4a52;
+    --ink-3:     #8b8b93;
+    --ink-4:     #b5b5bc;
+
+    --ok:        #00b65a;
+    --warn:      #ff8a00;
+    --crit:      #ff2d2d;
+    --info:      #1f6bff;
+
+    --r-card: 22px;
+    --r-pill: 999px;
+    --r-btn:  14px;
+
+    --pad: 20px;
+
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+                 "Helvetica Neue", Arial, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code",
+                 Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    font-feature-settings: "ss01","cv11";
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  /* Stage = full viewport background. No scaling — shell sizes to viewport. */
+  .stage {
+    position: fixed; inset: 0;
+    background: var(--bg);
+    overflow: hidden;
+  }
+
+  /* ---------- Shell ----------
+     Fluid: fills the viewport. Cards size naturally. Min 1100px wide so the
+     three-column grid doesn't collapse — below that the user can scroll. */
+  .shell {
+    width: 100vw;
+    height: 100vh;
+    min-width: 1100px;
+    margin: 0;
+    padding: 14px 18px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  /* ---------- Top bar ---------- */
+  .topbar {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    flex: 0 0 auto;
+  }
+  .topmeta {
+    display: flex; align-items: center; gap: 14px;
+    justify-content: flex-end;
+    font-size: 13px;
+    color: var(--ink-2);
+  }
+  .topmeta .sep { color: var(--ink-4); }
+  .topmeta .clock {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    font-weight: 500;
+  }
+
+  /* ---------- Banner ---------- */
+  .banner {
+    display: none;
+    align-items: center; gap: 10px;
+    background: #1c1c20;
+    color: #fff;
+    padding: 6px 14px;
+    border-radius: var(--r-pill);
+    font-size: 12px;
+    font-weight: 500;
+    position: absolute;
+    top: 56px; left: 50%; transform: translateX(-50%);
+    z-index: 10;
+  }
+  .banner.show { display: inline-flex; }
+  .banner .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--crit);
+    box-shadow: 0 0 0 4px rgba(255,45,45,.25);
+    animation: pulse 1.1s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%,100% { transform: scale(1); opacity: 1; }
+    50%     { transform: scale(.7); opacity: .6; }
+  }
+
+  /* ---------- Main grid ----------
+     Left = action buttons + critical telemetry (Battery / ToF / State).
+     Right = secondary telemetry (Altitude, Attitude, Velocity, Accel, Temp, RC).
+     Center = video + dpad. */
+  .grid {
+    display: grid;
+    grid-template-columns: 300px minmax(0, 1fr) 340px;
+    gap: 14px;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  /* Left column: controls then telemetry cards. Scrolls if viewport short. */
+  .actions {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding-right: 2px;
+  }
+  .actions > .card { flex: 0 0 auto; }
+  /* Last card (State) grows to fill any remaining vertical space in the
+     left column — kills the blank gap below it on tall viewports. */
+  .actions > .card:last-child { flex: 1 1 auto; min-height: 0; }
+  .actions > .controls {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 12px;
+  }
+  .actions > .controls .btn {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .card {
+    background: var(--surface);
+    border-radius: 16px;
+    border: 1px solid var(--line);
+  }
+  .card .head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 16px 0;
+  }
+  .card .head h3 {
+    margin: 0;
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--ink-3);
+    letter-spacing: .14em;
+    text-transform: uppercase;
+  }
+  .card .head .hint {
+    font-size: 10px;
+    color: var(--ink-3);
+    font-family: var(--font-mono);
+  }
+  .card .body { padding: 6px 16px 12px; }
+
+  /* ---------- Left: Status panel ---------- */
+  .status { display: flex; flex-direction: column; gap: 10px; min-height: 0; overflow-y: auto; overflow-x: hidden; padding-right: 2px; }
+  .status > .card { flex: 0 0 auto; }
+  .battery {
+    padding: 8px 16px 14px;
+  }
+  .battery .num {
+    font-weight: 800;
+    font-size: 40px;
+    line-height: 1;
+    letter-spacing: -.04em;
+    font-variant-numeric: tabular-nums;
+  }
+  .battery .num .unit {
+    font-size: 16px;
+    color: var(--ink-3);
+    font-weight: 600;
+    margin-left: 2px;
+  }
+  .battery .bar {
+    margin-top: 10px;
+    height: 6px;
+    background: var(--bg-2);
+    border-radius: var(--r-pill);
+    overflow: hidden;
+  }
+  .battery .fill {
+    height: 100%;
+    background: var(--ok);
+    border-radius: var(--r-pill);
+    transition: width .35s ease, background .2s;
+  }
+
+  .pills {
+    display: flex; flex-wrap: wrap; gap: 5px;
+    padding: 0 16px 12px;
+  }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 7px 11px;
+    border-radius: var(--r-pill);
+    background: var(--surface-2);
+    border: 1px solid var(--line);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--ink-2);
+    font-family: var(--font-sans);
+  }
+  .pill .pdot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--ink-4);
+  }
+  .pill.on { background: var(--ink); color: #fff; border-color: var(--ink); }
+  .pill.on .pdot { background: var(--ok); box-shadow: 0 0 0 3px rgba(0,182,90,.25); }
+  .pill.warn { background: var(--warn); color: #fff; border-color: var(--warn); }
+  .pill.warn .pdot { background: #fff; }
+  .pill.crit { background: var(--crit); color: #fff; border-color: var(--crit); }
+  .pill.crit .pdot { background: #fff; }
+  .pill.ok { background: var(--ok); color: #fff; border-color: var(--ok); }
+  .pill.ok .pdot { background: #fff; }
+
+  .status .conn {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 16px;
+    border-top: 1px solid var(--line);
+    font-size: 12px;
+    color: var(--ink-2);
+  }
+  .conn .cdot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--ok);
+    box-shadow: 0 0 0 4px rgba(0,182,90,.18);
+    transition: background .2s, box-shadow .2s;
+  }
+  .conn.lost .cdot {
+    background: var(--crit);
+    box-shadow: 0 0 0 4px rgba(255,45,45,.2);
+  }
+  .conn .lat {
+    margin-left: auto;
+    font-family: var(--font-mono);
+    color: var(--ink-3);
+    font-size: 11px;
+  }
+
+  .kv {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 7px 16px;
+    padding: 10px 16px 12px;
+    border-top: 1px solid var(--line);
+  }
+  .kv .k {
+    font-size: 11px;
+    color: var(--ink-3);
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    font-weight: 600;
+  }
+  .kv .v {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 13px;
+    color: var(--ink);
+    text-align: right;
+    font-weight: 500;
+  }
+  .kv .v.dim { color: var(--ink-3); }
+
+  /* ---------- Center: Video + controls ---------- */
+  /* Center column fills viewport. video-row grows, controls below.
+     No justify-content centering — would create empty space top/bottom. */
+  .center { display: flex; flex-direction: column; gap: 10px; min-width: 0; min-height: 0; overflow: hidden; }
+
+  .video-card {
+    background: var(--surface);
+    border-radius: 16px;
+    border: 1px solid var(--line);
+    padding: 10px;
+    position: relative;
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: 0;
+    /* Grid so the inner .video can use max-width/max-height: 100% with the
+       aspect-ratio trick. place-items centers when video shrinks below card. */
+    display: grid;
+    place-items: center;
+  }
+  .video {
+    position: relative;
+    background: #050608;
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid #0b0b0d;
+    box-shadow: inset 0 0 0 2px rgba(0,182,90,0);
+    transition: box-shadow .25s ease;
+    /* Native Tello stream is 960x720 (4:3). Fit inside card while preserving
+       aspect — browser shrinks whichever dimension hits its max first.
+       Never upscales past 960x720 (would blur). */
+    aspect-ratio: 4 / 3;
+    width: 100%;
+    height: 100%;
+    max-width: min(100%, 960px);
+    max-height: min(100%, 720px);
+    object-fit: contain;
+  }
+  .video img.feed {
+    /* contain (not cover) — show every pixel of the 960x720 source.
+       Aspect ratio matches container, so no letterboxing in practice. */
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+  }
+  .video.locked  { box-shadow: inset 0 0 0 2px rgba(0,182,90,.55), inset 0 0 60px rgba(0,182,90,.18); }
+  .video.lost    { box-shadow: inset 0 0 0 2px rgba(255,138,0,.55), inset 0 0 60px rgba(255,138,0,.16); }
+
+  /* corner brackets */
+  .corner {
+    position: absolute;
+    width: 22px; height: 22px;
+    border: 2px solid rgba(255,255,255,.6);
+  }
+  .corner.tl { top: 14px; left: 14px;   border-right: none; border-bottom: none; border-top-left-radius: 4px; }
+  .corner.tr { top: 14px; right: 14px;  border-left: none;  border-bottom: none; border-top-right-radius: 4px; }
+  .corner.bl { bottom: 14px; left: 14px;border-right: none; border-top: none;    border-bottom-left-radius: 4px; }
+  .corner.br { bottom: 14px; right: 14px;border-left: none; border-top: none;    border-bottom-right-radius: 4px; }
+
+  .v-overlay {
+    position: absolute;
+    display: flex; align-items: center; gap: 8px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: .08em;
+  }
+  .v-overlay.tl { top: 18px; left: 18px; }
+  .v-overlay.tr { top: 18px; right: 18px; }
+  .v-overlay.bl { bottom: 18px; left: 18px; }
+  .v-overlay.br { bottom: 18px; right: 18px; }
+  .mode-badge {
+    background: rgba(0,0,0,.55);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    color: #fff;
+    padding: 7px 12px;
+    border-radius: var(--r-pill);
+    font-weight: 600;
+    font-size: 11px;
+    letter-spacing: .18em;
+    text-transform: uppercase;
+    border: 1px solid rgba(255,255,255,.08);
+  }
+  .mode-badge .mdot {
+    display: inline-block;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--ok);
+    margin-right: 8px;
+    vertical-align: middle;
+  }
+  .video.lost .mode-badge .mdot { background: var(--warn); }
+  .phantom-tag {
+    background: rgba(31,107,255,.18);
+    border: 1px solid rgba(31,107,255,.5);
+    color: #cfe0ff;
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-weight: 700;
+    font-size: 10px;
+    letter-spacing: .28em;
+    display: none;
+  }
+  .video.phantom .phantom-tag { display: inline-block; }
+  .video.phantom { box-shadow: inset 0 0 0 2px rgba(31,107,255,.55), inset 0 0 60px rgba(31,107,255,.18); }
+
+  .rec-dot {
+    display: inline-block;
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--crit);
+    box-shadow: 0 0 0 3px rgba(255,45,45,.25);
+    margin-right: 6px;
+    vertical-align: middle;
+    animation: pulse 1.1s ease-in-out infinite;
+  }
+  .v-text { color: #fff; opacity: .8; font-weight: 500; font-size: 11px; }
+  .v-text .label { color: rgba(255,255,255,.5); margin-right: 6px; }
+
+  /* ---------- Control bar ---------- */
+  .controls {
+    background: var(--surface);
+    border-radius: 16px;
+    border: 1px solid var(--line);
+    padding: 10px;
+    display: grid;
+    grid-template-columns: 1.4fr 1fr 1fr 1fr 1.1fr;
+    gap: 10px;
+    flex: 0 0 auto;
+  }
+  .btn {
+    border: 1px solid var(--line);
+    background: var(--surface-2);
+    color: var(--ink);
+    padding: 18px 16px;
+    border-radius: 12px;
+    font: inherit;
+    font-weight: 700;
+    font-size: 14px;
+    letter-spacing: .02em;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: flex-start;
+    gap: 10px;
+    transition: transform .08s ease, background .15s, border-color .15s, color .15s;
+    text-align: left;
+    white-space: nowrap;
+  }
+  .btn:hover  { background: #eeeef0; }
+  .btn:active { transform: translateY(1px); }
+  .btn:focus-visible { outline: 2px solid var(--info); outline-offset: 2px; }
+
+  .btn .icn {
+    width: 34px; height: 34px;
+    flex: 0 0 34px;
+    border-radius: 10px;
+    display: grid; place-items: center;
+    background: var(--bg-2);
+    color: var(--ink-2);
+    font-family: var(--font-mono);
+    font-size: 18px;
+    font-weight: 700;
+  }
+  .btn .lbl {
+    flex: 1;
+    font-size: 16px;
+    line-height: 1.15;
+  }
+
+  .btn.primary {
+    background: var(--ink); color: #fff; border-color: var(--ink);
+  }
+  .btn.primary:hover { background: #222; }
+  .btn.primary .icn { background: rgba(255,255,255,.12); color: #fff; }
+
+  .btn.airborne { background: var(--crit); border-color: var(--crit); color: #fff; }
+  .btn.airborne:hover { background: #e02525; }
+  .btn.airborne .icn  { background: rgba(255,255,255,.18); color: #fff; }
+
+  .btn.manual { background: var(--warn); border-color: var(--warn); color: #fff; }
+  .btn.manual .icn { background: rgba(255,255,255,.2); color: #fff; }
+
+  .btn.danger {
+    background: #fff;
+    border: 1px solid var(--crit);
+    color: var(--crit);
+  }
+  .btn.danger .icn { background: rgba(255,45,45,.1); color: var(--crit); }
+  .btn.danger:hover { background: var(--crit); color: #fff; }
+  .btn.danger:hover .icn { background: rgba(255,255,255,.2); color: #fff; }
+
+  /* ---------- Manual dpad (web-only RC override) ----------
+     Two 3x3 pads. Left = throttle (up/down) + yaw (left/right).
+     Right = pitch (forward/back) + roll (left/right). Hold to move,
+     release to stop. Drone listens only when manual mode active —
+     dpad shows disabled until then. */
+  /* Row holding [left dpad | video | right dpad]. Grows to fill center
+     column. Dpads stretch to row height; video centers inside its card
+     and caps at 960x720 via .video max-* rules. */
+  .video-row {
+    display: flex;
+    align-items: stretch;
+    justify-content: center;
+    gap: 14px;
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+  .video-row > .video-card { flex: 1 1 auto; min-width: 0; }
+  .video-row > .dpad       { flex: 0 0 auto; align-self: stretch; }
+
+  /* Legacy dpad-row kept as no-op (dead rules). */
+  .dpad-row {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 36px;
+    background: var(--surface);
+    border-radius: 16px;
+    border: 1px solid var(--line);
+    padding: 10px 18px;
+    flex: 0 0 auto;
+    transition: opacity .2s;
+  }
+  .dpad-row.disabled,
+  .dpad.disabled {
+    opacity: .35;
+    pointer-events: none;
+  }
+  .dpad {
+    display: grid;
+    grid-template-columns: repeat(3, 46px);
+    grid-template-rows: auto repeat(3, 46px);
+    gap: 5px;
+    /* Card stretches to video height; keep button cluster centered both axes. */
+    align-content: center;
+    justify-content: center;
+    background: var(--surface);
+    border-radius: 16px;
+    border: 1px solid var(--line);
+    padding: 10px;
+    transition: opacity .2s;
+  }
+  .dpad .lbl {
+    grid-column: 1 / -1;
+    text-align: center;
+    font-size: 9.5px;
+    font-weight: 700;
+    color: var(--ink-3);
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    margin-bottom: 2px;
+  }
+  .dpad .pad-btn {
+    border: 1px solid var(--line);
+    background: var(--surface-2);
+    color: var(--ink-2);
+    border-radius: 10px;
+    font-family: var(--font-mono);
+    font-size: 22px;
+    font-weight: 700;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: manipulation;
+    display: grid; place-items: center;
+    transition: background .08s, color .08s, transform .06s;
+  }
+  .dpad .pad-btn:hover  { background: #eeeef0; }
+  .dpad .pad-btn:active,
+  .dpad .pad-btn.held   { background: var(--ink); color: #fff; transform: scale(.94); }
+  .dpad .pad-btn.center {
+    background: transparent;
+    border-color: transparent;
+    color: var(--ink-4);
+    font-size: 9px;
+    cursor: default;
+    letter-spacing: .12em;
+  }
+  .dpad .pad-btn.center:hover { background: transparent; }
+  .dpad .pad-btn.center:active { transform: none; background: transparent; color: var(--ink-4); }
+  .dpad-mid {
+    text-align: center;
+    font-size: 9.5px;
+    font-weight: 700;
+    color: var(--ink-3);
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    padding: 0 4px;
+  }
+  .dpad-mid .hint {
+    display: block;
+    font-family: var(--font-mono);
+    font-weight: 500;
+    font-size: 9px;
+    margin-top: 4px;
+    color: var(--ink-4);
+    letter-spacing: 0;
+    text-transform: none;
+  }
+
+  /* ---------- Right: Telemetry ---------- */
+  .telemetry {
+    display: flex; flex-direction: column; gap: 10px;
+    min-height: 0; overflow-y: auto; overflow-x: hidden;
+    padding-right: 2px;
+  }
+  /* Right sidebar telemetry cards: uniform fixed height so they don't
+     stretch/squash on resize. flex-shrink: 0 keeps them stable; the
+     aside has overflow-y: auto for scrolling when content exceeds. */
+  .telemetry > .card {
+    flex: 0 0 auto;
+    flex-shrink: 0;
+    height: 140px;
+  }
+  /* RC Output has 4 rc-rows + head — taller so all rows fit comfortably.
+     Also flex 1 1 auto so it grows to fill the right-column tail and
+     no blank gap appears below on tall viewports. */
+  .telemetry > .card.rc-card {
+    flex: 1 1 auto;
+    height: auto;
+    min-height: 200px;
+    display: flex;
+    flex-direction: column;
+  }
+  .telemetry > .card.rc-card .body {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    min-height: 0;
+  }
+
+  .big-num {
+    font-weight: 800;
+    font-size: 56px;
+    line-height: 1;
+    letter-spacing: -.04em;
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+  }
+  .big-num .unit {
+    font-size: 18px;
+    color: var(--ink-3);
+    font-weight: 600;
+    margin-left: 4px;
+    letter-spacing: 0;
+  }
+  .hero-num {
+    font-weight: 800;
+    font-size: 76px;
+    line-height: .92;
+    letter-spacing: -.05em;
+    font-variant-numeric: tabular-nums;
+  }
+  .hero-num .unit {
+    font-size: 20px;
+    color: var(--ink-3);
+    font-weight: 700;
+    margin-left: 6px;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+  }
+  .mid-num {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    font-size: 13px;
+  }
+
+  /* Altitude */
+  .alt-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    align-items: end;
+    margin-top: 4px;
+  }
+  .alt-row .sec {
+    display: flex; flex-direction: column;
+  }
+  .alt-row small {
+    font-size: 10px;
+    color: var(--ink-3);
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  .spark-wrap {
+    margin-top: 8px;
+    height: 38px;
+    width: 100%;
+    position: relative;
+  }
+  .spark-wrap svg { width: 100%; height: 100%; display: block; }
+  .spark-wrap .target-line { stroke: var(--ink-4); stroke-width: 1; stroke-dasharray: 3 3; }
+  .spark-wrap .spark { stroke: var(--ink); stroke-width: 1.6; fill: none; }
+  .spark-wrap .fill  { fill: rgba(0,0,0,.05); }
+
+  /* Distance */
+  .dist-card .hero-num.crit, .dist-card #dist-v.crit { color: var(--crit); }
+  .freeze-badge {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 4px 8px;
+    background: var(--crit);
+    color: #fff;
+    border-radius: 6px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    vertical-align: middle;
+  }
+  .dist-card .scale {
+    margin-top: 10px;
+    height: 5px;
+    background: var(--bg-2);
+    border-radius: var(--r-pill);
+    position: relative;
+  }
+  .dist-card .scale .fill {
+    height: 100%;
+    background: var(--ink);
+    border-radius: var(--r-pill);
+    transition: width .25s, background .15s;
+  }
+  .dist-card .scale .mark {
+    position: absolute;
+    top: -5px; bottom: -5px;
+    width: 1px;
+    background: var(--ink-4);
+  }
+  .dist-card .scale .mark::after {
+    content: "60";
+    position: absolute;
+    bottom: -16px; left: -8px;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    color: var(--ink-3);
+  }
+
+  /* Attitude */
+  .att-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 6px;
+    margin-top: 6px;
+  }
+  .att-grid .cell { text-align: center; }
+  .att-grid .cell small {
+    display: block;
+    font-size: 9.5px;
+    color: var(--ink-3);
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    font-weight: 700;
+    margin-bottom: 2px;
+  }
+  .att-grid .cell .v {
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 15px;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -.02em;
+  }
+  .att-grid .cell .v .deg {
+    color: var(--ink-3);
+    font-weight: 500;
+    font-size: 11px;
+  }
+  .horizon {
+    margin-top: 8px;
+    height: 44px;
+    min-height: 44px;
+    border-radius: 10px;
+    background: #f0f0f2;
+    overflow: hidden;
+    position: relative;
+  }
+  .horizon .sky {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(#cfd6e0 0%, #aab5c4 50%, #6b6b73 50%, #4a4a52 100%);
+    transform-origin: center;
+    transition: transform .25s ease;
+  }
+  .horizon .center-line {
+    position: absolute; left: 50%; top: 0; bottom: 0;
+    width: 1px; background: rgba(255,255,255,.4);
+  }
+  .horizon .reticle {
+    position: absolute; left: 50%; top: 50%;
+    transform: translate(-50%,-50%);
+    width: 70%; height: 1px;
+    background: var(--ink);
+  }
+  .horizon .reticle::before, .horizon .reticle::after {
+    content: ""; position: absolute; top: -3px; width: 7px; height: 7px;
+    background: var(--ink);
+  }
+  .horizon .reticle::before { left: 0; }
+  .horizon .reticle::after  { right: 0; }
+
+  /* Velocity / Accel grids */
+  .triple {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 6px;
+    margin-top: 4px;
+  }
+  .triple .cell {
+    background: var(--surface-2);
+    border-radius: 10px;
+    padding: 6px 8px;
+  }
+  .triple .cell small {
+    display: block;
+    font-size: 9.5px;
+    color: var(--ink-3);
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    font-weight: 700;
+    margin-bottom: 2px;
+  }
+  .triple .cell .v {
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 15px;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -.02em;
+  }
+  .triple .cell .v.pos { color: var(--ok); }
+  .triple .cell .v.neg { color: var(--crit); }
+
+  /* RC output bars */
+  .rc-row {
+    display: grid;
+    grid-template-columns: 48px 1fr 44px;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 0;
+  }
+  .rc-row + .rc-row { border-top: 1px solid var(--line); }
+  .rc-row .name {
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--ink-2);
+    letter-spacing: .12em;
+    text-transform: uppercase;
+  }
+  .rc-row .val {
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    font-size: 13px;
+  }
+  .rc-bar {
+    height: 8px;
+    background: var(--surface-2);
+    border-radius: var(--r-pill);
+    position: relative;
+    overflow: hidden;
+  }
+  .rc-bar::before {
+    content: ""; position: absolute;
+    left: 50%; top: 0; bottom: 0;
+    width: 1px; background: var(--ink-4);
+    transform: translateX(-.5px);
+    z-index: 1;
+  }
+  .rc-bar .seg {
+    position: absolute;
+    top: 0; bottom: 0;
+    background: var(--ink);
+    transition: width .15s ease, left .15s ease, background .15s;
+  }
+  .rc-bar .seg.warn { background: var(--warn); }
+
+  /* ---------- Bottom strip (under controls) ---------- */
+  .strip {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 10px;
+    flex: 0 0 auto;
+  }
+  .strip .card { display: flex; flex-direction: column; }
+  .strip .card .body { padding: 4px 14px 10px; }
+  .strip .card .head { padding: 8px 14px 0; }
+
+  /* Temp inline (in bottom strip) */
+  .temp-inline { display: flex; gap: 10px; align-items: baseline; margin-top: 4px; }
+  .temp-inline .seg { display: flex; align-items: baseline; gap: 4px; }
+  .temp-inline .lbl { font-size: 9.5px; font-weight: 700; color: var(--ink-3); letter-spacing: .12em; text-transform: uppercase; }
+  .temp-inline .v { font-weight: 800; font-size: 22px; line-height: 1; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
+  .temp-inline .v .unit { font-size: 11px; color: var(--ink-3); font-weight: 600; }
+  .temp-inline .sep { color: var(--ink-4); margin: 0 4px; font-size: 18px; }
+
+  /* ---------- Modal ---------- */
+  .modal-wrap {
+    position: fixed; inset: 0;
+    background: rgba(20,20,24,.45);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    display: none;
+    align-items: center; justify-content: center;
+    z-index: 100;
+  }
+  .modal-wrap.show { display: flex; }
+  .modal {
+    background: var(--surface);
+    border-radius: 18px;
+    padding: 28px;
+    width: 420px;
+    box-shadow: 0 20px 60px rgba(0,0,0,.18);
+    border: 1px solid var(--line);
+  }
+  .modal h2 {
+    margin: 0 0 6px;
+    font-size: 22px;
+    letter-spacing: -.03em;
+    font-weight: 800;
+  }
+  .modal p {
+    margin: 0 0 22px;
+    color: var(--ink-2);
+    line-height: 1.5;
+    font-size: 14px;
+  }
+  .modal .actions {
+    display: flex; gap: 10px; justify-content: flex-end;
+  }
+  .modal .btn { padding: 12px 16px; min-width: 100px; justify-content: center; }
+  .modal .btn .lbl { flex: 0; text-align: center; }
+
+  /* Responsive (legacy — controls now vertical inside .actions, this is dead) */
+  @media (max-width: 1480px) {
+    .controls:not(.actions > .controls) {
+      grid-template-columns: 1.4fr 1fr 1fr 1fr 1fr;
+    }
+  }
+
+  /* ---------- Accessibility / readable label sizes ----------
+     Bumped from original 9–11 px to 11–13 px so labels are legible at
+     normal monitor distance. Big numbers (battery, hero ToF, big-num)
+     unchanged — they were already prominent. */
+  .card .head h3       { font-size: 12px; }
+  .card .head .hint    { font-size: 12px; }
+  .pill                { font-size: 13px; padding: 8px 12px; }
+  .pill .pdot          { width: 8px; height: 8px; }
+  .conn                { font-size: 14px; }
+  .kv .k               { font-size: 13px; }
+  .kv .v               { font-size: 15px; }
+  .alt-row small       { font-size: 12px; }
+  .mid-num             { font-size: 15px; }
+  .triple .cell small  { font-size: 11px; }
+  .triple .cell .v     { font-size: 18px; }
+  .att-grid .cell small { font-size: 11px; }
+  .att-grid .cell .v    { font-size: 20px; }
+  .temp-inline .lbl    { font-size: 11px; }
+  .temp-inline .v      { font-size: 24px; }
+  .rc-row .name        { font-size: 13px; }
+  .rc-row .val         { font-size: 15px; }
+  .dpad .lbl           { font-size: 11px; }
+  .actions > .controls .btn       { font-size: 15px; padding: 16px 14px; }
+  .actions > .controls .btn .lbl  { font-size: 17px; }
+  .actions > .controls .btn .icn  { width: 34px; height: 34px; flex-basis: 34px; font-size: 18px; }
+
+  /* ---------- Target selector (inside State card KV row) ---------- */
+  .tgt-select {
+    appearance: none;
+    -webkit-appearance: none;
+    background: var(--surface-2);
+    color: var(--ink);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 4px 22px 4px 8px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    background-image: linear-gradient(45deg, transparent 50%, var(--ink-3) 50%),
+                      linear-gradient(135deg, var(--ink-3) 50%, transparent 50%);
+    background-position: calc(100% - 12px) 50%, calc(100% - 8px) 50%;
+    background-size: 4px 4px;
+    background-repeat: no-repeat;
+  }
+  .tgt-select:hover  { border-color: var(--ink-3); }
+  .tgt-select:focus  { outline: 2px solid var(--info); outline-offset: 1px; }
+</style>
+</head>
+<body>
+<div class="stage">
+<div class="shell" id="shell">
+
+  <!-- ===== Banner ===== -->
+  <div class="banner" id="banner">
+    <span class="dot"></span>
+    <span>Telemetry link lost &mdash; attempting reconnect&hellip;</span>
+  </div>
+
+  <!-- ===== Main Grid ===== -->
+  <div class="grid">
+
+    <!-- ========== LEFT: Telemetry cards ========== -->
+    <aside class="actions">
+
+      <!-- BATTERY -->
+      <div class="card">
+        <div class="head"><h3>Battery</h3></div>
+        <div class="battery">
+          <div class="num" id="bat-pct">&mdash;<span class="unit">%</span></div>
+          <div class="bar"><div class="fill" id="bat-fill" style="width: 0%"></div></div>
+        </div>
+      </div>
+
+      <!-- FORWARD RANGE (ToF) -->
+      <div class="card dist-card">
+        <div class="head">
+          <h3>Forward Range &middot; ToF</h3>
+          <span class="hint" id="dist-state">&mdash;</span>
+        </div>
+        <div class="body">
+          <div class="hero-num"><span id="dist-v">&mdash;</span><span class="unit">cm</span><span class="freeze-badge" id="freeze-badge" style="display:none;">WALL</span></div>
+          <div class="scale">
+            <div class="fill" id="dist-fill" style="width: 0%"></div>
+            <div class="mark" style="left: 20%"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ALTITUDE -->
+      <div class="card">
+        <div class="head">
+          <h3>Altitude</h3>
+          <span class="hint">target 150 cm</span>
+        </div>
+        <div class="body">
+          <div class="big-num"><span id="alt-h">&mdash;</span><span class="unit">cm</span></div>
+          <div class="alt-row">
+            <div class="sec">
+              <small>Floor (ToF)</small>
+              <span class="mid-num"><span id="alt-tof">&mdash;</span> <span style="color:var(--ink-3); font-weight:500;">cm</span></span>
+            </div>
+            <div class="sec">
+              <small>Climb rate</small>
+              <span class="mid-num"><span id="alt-rate">&mdash;</span> <span style="color:var(--ink-3); font-weight:500;">m/s</span></span>
+            </div>
+          </div>
+          <div class="spark-wrap">
+            <svg viewBox="0 0 200 56" preserveAspectRatio="none">
+              <line class="target-line" x1="0" y1="22" x2="200" y2="22"/>
+              <path class="fill" id="spark-fill" d=""/>
+              <path class="spark" id="spark-line" d=""/>
+            </svg>
+          </div>
+        </div>
+      </div>
+
+      <!-- STATE -->
+      <div class="card">
+        <div class="head"><h3>State</h3></div>
+        <div class="pills" id="state-pills">
+          <span class="pill" id="pill-air"><span class="pdot"></span>Grounded</span>
+          <span class="pill" id="pill-mode"><span class="pdot"></span>Auto</span>
+          <span class="pill" id="pill-phantom"><span class="pdot"></span>Live</span>
+        </div>
+
+        <div class="conn lost" id="conn">
+          <span class="cdot"></span>
+          <span id="conn-text">Connecting&hellip;</span>
+        </div>
+
+        <div class="kv">
+          <span class="k">Lock ID</span>           <span class="v" id="lock-id">&mdash;</span>
+          <span class="k">Target</span>            <span class="v"><select id="tgt-select" class="tgt-select"><option value="">&mdash;</option></select></span>
+          <span class="k">Search</span>            <span class="v dim" id="search-st">&mdash;</span>
+          <span class="k">Mode</span>              <span class="v" id="mode-txt">init</span>
+          <span class="k">Flight Time</span>       <span class="v" id="ftime">00:00</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ========== CENTER: Video + Controls ========== -->
+    <section class="center">
+      <!-- Video row: throttle/yaw pad on the LEFT side of the frame,
+           pitch/roll pad on the RIGHT. Both greyed individually until
+           manual mode is on. Centered vertically against the video. -->
+      <div class="video-row">
+
+        <div class="dpad disabled" id="dpad-left" aria-label="Throttle and yaw">
+          <div class="lbl">Throttle &middot; Yaw</div>
+          <button class="pad-btn" style="grid-column:2; grid-row:2" data-lr="0" data-fb="0" data-ud="80"  data-yaw="0">&uarr;</button>
+          <button class="pad-btn" style="grid-column:1; grid-row:3" data-lr="0" data-fb="0" data-ud="0"  data-yaw="-80">&larr;</button>
+          <button class="pad-btn center" style="grid-column:2; grid-row:3" disabled>STOP</button>
+          <button class="pad-btn" style="grid-column:3; grid-row:3" data-lr="0" data-fb="0" data-ud="0"  data-yaw="80">&rarr;</button>
+          <button class="pad-btn" style="grid-column:2; grid-row:4" data-lr="0" data-fb="0" data-ud="-80" data-yaw="0">&darr;</button>
+        </div>
+
+        <div class="video-card">
+          <div class="video" id="video">
+            <!-- MJPEG stream served by FastAPI /video endpoint. The Python HUD
+                 already draws crosshair, bbox, target overlays on the frame
+                 before it ships, so we don't draw a second bbox here. -->
+            <img class="feed" id="feed" src="/video" alt="drone video" />
+
+            <span class="corner tl"></span>
+            <span class="corner tr"></span>
+            <span class="corner bl"></span>
+            <span class="corner br"></span>
+
+            <div class="v-overlay tl">
+              <span class="mode-badge">
+                <span class="mdot"></span><span id="vmode">INIT</span>
+              </span>
+            </div>
+            <div class="v-overlay tr">
+              <span class="phantom-tag">PHANTOM</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="dpad disabled" id="dpad-right" aria-label="Pitch and roll">
+          <div class="lbl">Pitch &middot; Roll</div>
+          <button class="pad-btn" style="grid-column:2; grid-row:2" data-lr="0"   data-fb="80"  data-ud="0" data-yaw="0">&uarr;</button>
+          <button class="pad-btn" style="grid-column:1; grid-row:3" data-lr="-80" data-fb="0"   data-ud="0" data-yaw="0">&larr;</button>
+          <button class="pad-btn center" style="grid-column:2; grid-row:3" disabled>STOP</button>
+          <button class="pad-btn" style="grid-column:3; grid-row:3" data-lr="80"  data-fb="0"   data-ud="0" data-yaw="0">&rarr;</button>
+          <button class="pad-btn" style="grid-column:2; grid-row:4" data-lr="0"   data-fb="-80" data-ud="0" data-yaw="0">&darr;</button>
+        </div>
+
+      </div>
+
+      <!-- Control bar under video (duplicates the left-aside stack for
+           reach without aiming at the sidebar). State updates fan out to
+           every matching [data-cmd] via querySelectorAll. -->
+      <div class="controls controls-row" role="toolbar" aria-label="Drone controls">
+        <button class="btn primary" data-cmd="takeoff_land">
+          <span class="icn">&uarr;</span>
+          <span class="lbl">Takeoff</span>
+        </button>
+        <button class="btn" data-cmd="toggle_manual">
+          <span class="icn">&oplus;</span>
+          <span class="lbl">Manual</span>
+        </button>
+        <button class="btn" data-cmd="enroll">
+          <span class="icn">&#xff0b;</span>
+          <span class="lbl">Enroll</span>
+        </button>
+        <button class="btn" data-cmd="clear_lock">
+          <span class="icn">&times;</span>
+          <span class="lbl">Clear</span>
+        </button>
+        <button class="btn danger" data-cmd="stop">
+          <span class="icn">&otimes;</span>
+          <span class="lbl">E-Stop</span>
+        </button>
+      </div>
+
+    </section>
+
+    <!-- ========== RIGHT: Telemetry ========== -->
+    <aside class="telemetry">
+
+      <!-- ATTITUDE (angles only — horizon graphic removed) -->
+      <div class="card">
+        <div class="head">
+          <h3>Attitude</h3>
+          <span class="hint">deg</span>
+        </div>
+        <div class="body">
+          <div class="att-grid">
+            <div class="cell"><small>Pitch</small><span class="v"><span id="att-p">&mdash;</span><span class="deg">&deg;</span></span></div>
+            <div class="cell"><small>Roll</small><span class="v"><span id="att-r">&mdash;</span><span class="deg">&deg;</span></span></div>
+            <div class="cell"><small>Yaw</small><span class="v"><span id="att-y">&mdash;</span><span class="deg">&deg;</span></span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- VELOCITY -->
+      <div class="card">
+        <div class="head"><h3>Velocity</h3><span class="hint">dm/s</span></div>
+        <div class="body">
+          <div class="triple">
+            <div class="cell"><small>Vx</small><span class="v" id="vx">&mdash;</span></div>
+            <div class="cell"><small>Vy</small><span class="v" id="vy">&mdash;</span></div>
+            <div class="cell"><small>Vz</small><span class="v" id="vz">&mdash;</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ACCELERATION -->
+      <div class="card">
+        <div class="head"><h3>Acceleration</h3><span class="hint">cm/s&sup2;</span></div>
+        <div class="body">
+          <div class="triple">
+            <div class="cell"><small>Ax</small><span class="v" id="ax">&mdash;</span></div>
+            <div class="cell"><small>Ay</small><span class="v" id="ay">&mdash;</span></div>
+            <div class="cell"><small>Az</small><span class="v" id="az">&mdash;</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- CORE TEMP -->
+      <div class="card">
+        <div class="head"><h3>Core Temp</h3><span class="hint">&deg;C</span></div>
+        <div class="body">
+          <div class="temp-inline">
+            <div class="seg"><span class="lbl">Min</span><span class="v"><span id="t-min">&mdash;</span><span class="unit">&deg;</span></span></div>
+            <span class="sep">/</span>
+            <div class="seg"><span class="lbl">Max</span><span class="v"><span id="t-max">&mdash;</span><span class="unit">&deg;</span></span></div>
+          </div>
+          <div style="margin-top: 8px; height: 6px; background: var(--bg-2); border-radius: 999px; position: relative; overflow: hidden;">
+            <div id="temp-fill" style="position:absolute; left: 0%; width: 0%; top:0; bottom:0; background: linear-gradient(90deg, var(--ok), var(--warn)); border-radius: 999px;"></div>
+          </div>
+          <div style="display:flex; justify-content: space-between; margin-top: 4px; font-family: var(--font-mono); font-size: 9px; color: var(--ink-3);">
+            <span>20&deg;</span><span>60&deg;</span><span>100&deg;</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- RC OUTPUT — fills the right column tail -->
+      <div class="card rc-card">
+        <div class="head"><h3>RC Output</h3><span class="hint">cm/s &middot; &plusmn;100</span></div>
+        <div class="body" style="padding-top: 2px;">
+          <div class="rc-row"><span class="name">L/R</span><div class="rc-bar"><div class="seg" id="rc-lr-bar"></div></div><span class="val" id="rc-lr">&mdash;</span></div>
+          <div class="rc-row"><span class="name">F/B</span><div class="rc-bar"><div class="seg" id="rc-fb-bar"></div></div><span class="val" id="rc-fb">&mdash;</span></div>
+          <div class="rc-row"><span class="name">U/D</span><div class="rc-bar"><div class="seg" id="rc-ud-bar"></div></div><span class="val" id="rc-ud">&mdash;</span></div>
+          <div class="rc-row"><span class="name">Yaw</span><div class="rc-bar"><div class="seg" id="rc-yaw-bar"></div></div><span class="val" id="rc-yaw">&mdash;</span></div>
+        </div>
+      </div>
+
+    </aside>
+  </div>
+</div>
+</div>
+
+<!-- E-Stop confirmation modal -->
+<div class="modal-wrap" id="modal">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="m-title">
+    <h2 id="m-title">Emergency stop?</h2>
+    <p>Kill the video loop and trigger landing. Use only if the drone is misbehaving.</p>
+    <div class="actions">
+      <button class="btn" id="m-cancel"><span class="lbl">Cancel</span></button>
+      <button class="btn danger" id="m-confirm"><span class="lbl">Confirm E-Stop</span></button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* =========================================================
+   Tello Operator Console — client logic
+   ========================================================= */
+
+const $ = (id) => document.getElementById(id);
+const isMissing = (v) => v === null || v === undefined || v === -1 || v === -1.0;
+const fmt = (v, digits = 0) => {
+  if (isMissing(v)) return "—";
+  if (typeof v === "number" && !isFinite(v)) return "—";
+  return digits ? Number(v).toFixed(digits) : Math.round(v);
+};
+const signed = (v) => isMissing(v) ? "—" : (v >= 0 ? "+" + Math.round(v) : String(Math.round(v)));
+
+/* ----- Sparkline buffer (last 60 telemetry samples of height_cm) ----- */
+const sparkBuf = new Array(60).fill(0);
+function drawSparkline(targetCm) {
+  const w = 200, h = 56;
+  const max = 250, min = 0;
+  const n = sparkBuf.length;
+  const xs = (i) => (i / (n - 1)) * w;
+  const ys = (v) => h - ((v - min) / (max - min)) * h;
+  let d = "M " + xs(0) + " " + ys(sparkBuf[0]);
+  for (let i = 1; i < n; i++) d += " L " + xs(i) + " " + ys(sparkBuf[i]);
+  $("spark-line").setAttribute("d", d);
+  $("spark-fill").setAttribute("d", d + ` L ${w} ${h} L 0 ${h} Z`);
+  const ty = ys(targetCm);
+  document.querySelector(".target-line").setAttribute("y1", ty);
+  document.querySelector(".target-line").setAttribute("y2", ty);
+}
+
+/* ----- RC bar render. Value -100..100, anchored at center 50%. ----- */
+function renderRCBar(barId, val) {
+  const el = $(barId);
+  if (isMissing(val)) {
+    el.style.width = "0%"; el.style.left = "50%";
+    return;
+  }
+  const clamped = Math.max(-100, Math.min(100, val));
+  const pct = Math.abs(clamped) / 2;
+  el.style.width = pct + "%";
+  el.classList.toggle("warn", Math.abs(clamped) > 60);
+  if (clamped >= 0) {
+    el.style.left = "50%";
+  } else {
+    el.style.left = (50 - pct) + "%";
+  }
+}
+
+/* ----- Apply telemetry to UI ----- */
+let flightStart = null;
+function applyTelemetry(t) {
+  /* Battery */
+  const bp = t.battery_percent;
+  $("bat-pct").innerHTML = (isMissing(bp) ? "—" : bp) + '<span class="unit">%</span>';
+  const fill = $("bat-fill");
+  fill.style.width = (isMissing(bp) ? 0 : bp) + "%";
+  fill.style.background =
+    isMissing(bp) ? "var(--ink-4)" :
+    bp < 20 ? "var(--crit)" :
+    bp < 40 ? "var(--warn)" : "var(--ok)";
+  /* State pills */
+  const pAir = $("pill-air"), pMode = $("pill-mode"), pPh = $("pill-phantom");
+  pAir.innerHTML = '<span class="pdot"></span>' + (t.is_airborne ? "Airborne" : "Grounded");
+  pAir.className = "pill" + (t.is_airborne ? " crit" : "");
+  pMode.innerHTML = '<span class="pdot"></span>' + (t.is_manual ? "Manual" : "Auto");
+  pMode.className = "pill" + (t.is_manual ? " warn" : " on");
+  pPh.innerHTML = '<span class="pdot"></span>' + (t.phantom_mode ? "Phantom" : "Live");
+  pPh.className = "pill" + (t.phantom_mode ? "" : " ok");
+
+  /* Lock / target / mode kv */
+  $("lock-id").textContent = t.locked_track_id == null ? "—" : ("#" + t.locked_track_id);
+  syncTargetSelect(t.available_targets, t.target_name);
+  $("search-st").textContent = t.search_state || "—";
+  $("mode-txt").textContent = t.mode || "—";
+
+  /* Video frame state classes (locked/lost/phantom border glow) */
+  const video = $("video");
+  const locked = t.locked_track_id != null;
+  video.classList.toggle("locked", locked && !t.phantom_mode);
+  video.classList.toggle("lost", !locked && !t.phantom_mode);
+  video.classList.toggle("phantom", !!t.phantom_mode);
+  $("vmode").textContent = (t.mode || "—").toUpperCase();
+
+  /* Altitude */
+  $("alt-h").textContent = fmt(t.height_cm);
+  $("alt-tof").textContent = fmt(t.down_tof_cm);
+  if (!isMissing(t.height_cm)) {
+    sparkBuf.push(t.height_cm);
+    sparkBuf.shift();
+  }
+  drawSparkline(150);
+  const last = sparkBuf[sparkBuf.length - 2];
+  const cur  = sparkBuf[sparkBuf.length - 1];
+  const rate = ((cur - last) / 100) * 20;
+  $("alt-rate").textContent = (rate >= 0 ? "+" : "") + rate.toFixed(2);
+
+  /* Forward ToF (hero) */
+  const d = t.front_tof_cm;
+  $("dist-v").textContent = fmt(d);
+  const wall = !isMissing(d) && d < 60;
+  $("dist-v").classList.toggle("crit", wall);
+  $("freeze-badge").style.display = wall ? "inline-block" : "none";
+  $("dist-state").textContent = wall ? "WALL" : (locked ? "Tracking" : "Scanning");
+  const distFill = $("dist-fill");
+  distFill.style.width = Math.max(2, Math.min(100, (isMissing(d) ? 0 : d) / 3)) + "%";
+  distFill.style.background = wall ? "var(--crit)" : "var(--ink)";
+
+  /* Attitude — angles only; horizon graphic removed. */
+  $("att-p").textContent = fmt(t.pitch_deg);
+  $("att-r").textContent = fmt(t.roll_deg);
+  $("att-y").textContent = fmt(t.yaw_deg);
+
+  /* Velocity / Accel */
+  $("vx").textContent = signed(t.vx_dm_s);
+  $("vy").textContent = signed(t.vy_dm_s);
+  $("vz").textContent = signed(t.vz_dm_s);
+  $("ax").textContent = signed(t.ax_cm_s2);
+  $("ay").textContent = signed(t.ay_cm_s2);
+  $("az").textContent = signed(t.az_cm_s2);
+
+  /* RC bars */
+  $("rc-lr").textContent = signed(t.rc_lr);
+  $("rc-fb").textContent = signed(t.rc_fb);
+  $("rc-ud").textContent = signed(t.rc_ud);
+  $("rc-yaw").textContent = signed(t.rc_yaw);
+  renderRCBar("rc-lr-bar",  t.rc_lr);
+  renderRCBar("rc-fb-bar",  t.rc_fb);
+  renderRCBar("rc-ud-bar",  t.rc_ud);
+  renderRCBar("rc-yaw-bar", t.rc_yaw);
+
+  /* Core temperature gradient bar (20-100 deg C scale) */
+  $("t-min").textContent = fmt(t.temp_min_c);
+  $("t-max").textContent = fmt(t.temp_max_c);
+  const tf = $("temp-fill");
+  if (!isMissing(t.temp_min_c) && !isMissing(t.temp_max_c)) {
+    const lo = Math.max(20, Math.min(100, t.temp_min_c));
+    const hi = Math.max(20, Math.min(100, t.temp_max_c));
+    const left  = ((lo - 20) / 80) * 100;
+    const right = ((hi - 20) / 80) * 100;
+    tf.style.left  = left + "%";
+    tf.style.width = Math.max(2, right - left) + "%";
+  } else {
+    tf.style.width = "0%";
+  }
+
+  /* Takeoff button toggles primary <-> airborne (red) on state change.
+     Fan out to every matching [data-cmd] so the duplicated left + center
+     control bars both reflect state. */
+  document.querySelectorAll('[data-cmd="takeoff_land"]').forEach(tk => {
+    if (t.is_airborne) {
+      tk.classList.remove("primary"); tk.classList.add("airborne");
+      tk.querySelector(".lbl").textContent = "Land";
+      tk.querySelector(".icn").textContent = "↓";
+    } else {
+      tk.classList.add("primary"); tk.classList.remove("airborne");
+      tk.querySelector(".lbl").textContent = "Takeoff";
+      tk.querySelector(".icn").textContent = "↑";
+    }
+  });
+  document.querySelectorAll('[data-cmd="toggle_manual"]').forEach(mn => {
+    mn.classList.toggle("manual", !!t.is_manual);
+  });
+  /* Dpads enabled only when interceptor is in manual mode. Both pads (left
+     throttle/yaw + right pitch/roll) flip together. */
+  document.querySelectorAll(".dpad").forEach(p => p.classList.toggle("disabled", !t.is_manual));
+
+  /* Flight time — start when airborne flips true, reset when grounded */
+  if (t.is_airborne && flightStart == null) flightStart = Date.now();
+  if (!t.is_airborne) flightStart = null;
+  if (flightStart) {
+    const s = Math.floor((Date.now()-flightStart)/1000);
+    $("ftime").textContent = `${String(Math.floor(s/60)).padStart(2,"0")}:${String(s%60).padStart(2,"0")}`;
+  } else {
+    $("ftime").textContent = "00:00";
+  }
+}
+
+/* ----- WebSocket plumbing — auto-reconnect every 1s on close. ----- */
+let ws = null, wsTimer = null, lostTimer = null;
+function setConn(connected) {
+  const c = $("conn"); const txt = $("conn-text"); const banner = $("banner");
+  if (connected) {
+    clearTimeout(lostTimer);
+    c.classList.remove("lost");
+    txt.textContent = "WebSocket linked";
+    banner.classList.remove("show");
+  } else {
+    c.classList.add("lost");
+    txt.textContent = "Reconnecting…";
+    clearTimeout(lostTimer);
+    /* Banner only after 1s of confirmed loss — avoids flash on momentary blip. */
+    lostTimer = setTimeout(()=>banner.classList.add("show"), 1000);
+  }
+}
+function connectWS() {
+  try {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    ws = new WebSocket(`${proto}://${location.host}/ws/telemetry`);
+    ws.onopen = () => setConn(true);
+    ws.onmessage = (e) => {
+      try { applyTelemetry(JSON.parse(e.data)); } catch(err) {}
+    };
+    ws.onclose = () => {
+      setConn(false);
+      clearTimeout(wsTimer); wsTimer = setTimeout(connectWS, 1000);
+    };
+    ws.onerror = () => { try { ws.close(); } catch(_){} };
+  } catch (e) {
+    setConn(false); wsTimer = setTimeout(connectWS, 1000);
+  }
+}
+
+/* ----- POST command endpoints ----- */
+async function sendCmd(name) {
+  try {
+    const r = await fetch(`/cmd/${name}`, { method: "POST" });
+    if (!r.ok) throw new Error("cmd " + name + " " + r.status);
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+/* ----- Target selector -----
+ * Populate the <select> with available_targets from telemetry (only when
+ * the list changes — DOM rebuilds clear the user's open dropdown). Reflect
+ * the active target unless the user is currently changing it. On change,
+ * POST /cmd/set_target. Revert on 400 (backend rejected name).
+ */
+let _lastTargetsKey = "";
+let _userPickingTarget = false;
+function syncTargetSelect(available, active) {
+  const sel = $("tgt-select");
+  if (!sel) return;
+  const list = Array.isArray(available) ? available : [];
+  const key = list.join("|");
+  if (key !== _lastTargetsKey) {
+    sel.innerHTML = list.length
+      ? list.map(n => `<option value="${n}">${n}</option>`).join("")
+      : '<option value="">—</option>';
+    _lastTargetsKey = key;
+  }
+  if (!_userPickingTarget && active && sel.value !== active) {
+    sel.value = active;
+  }
+}
+
+async function onTargetChange(e) {
+  const name = e.target.value;
+  if (!name) return;
+  _userPickingTarget = true;
+  try {
+    const r = await fetch("/cmd/set_target", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    if (!r.ok) console.error("set_target rejected:", await r.text());
+  } catch (err) {
+    console.error(err);
+  } finally {
+    /* Brief lock so the next WS tick doesn't overwrite the user's choice
+       before the backend has applied it. */
+    setTimeout(() => { _userPickingTarget = false; }, 500);
+  }
+}
+
+function wireButtons() {
+  document.querySelectorAll(".btn[data-cmd]").forEach(b => {
+    const cmd = b.dataset.cmd;
+    b.addEventListener("click", () => {
+      if (cmd === "stop") { $("modal").classList.add("show"); return; }
+      sendCmd(cmd);
+    });
+  });
+  $("m-cancel").onclick  = () => $("modal").classList.remove("show");
+  $("m-confirm").onclick = () => { $("modal").classList.remove("show"); sendCmd("stop"); };
+  const sel = $("tgt-select");
+  if (sel) sel.addEventListener("change", onTargetChange);
+  /* Esc dismisses confirm modal */
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") $("modal").classList.remove("show");
+  });
+}
+
+/* ----- Manual dpad hold-to-move -----
+ * Press a button: POST /cmd/manual_set with that button's velocities, then
+ * repeat the POST every 100 ms while held. On release / mouseleave / touch
+ * end / window blur, POST zeros once. The interceptor only honors these
+ * values when is_manual is true AND no keyboard movement key is held;
+ * keyboard always wins at the host PC.
+ */
+async function sendManual(lr, fb, ud, yaw) {
+  try {
+    await fetch("/cmd/manual_set", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lr, fb, ud, yaw }),
+    });
+  } catch (e) { /* swallow — heartbeat will retry */ }
+}
+const ZERO = { lr: 0, fb: 0, ud: 0, yaw: 0 };
+
+function wireDpad() {
+  let heldBtn = null;
+  let heartbeat = null;
+
+  function start(btn) {
+    if (btn.classList.contains("center")) return;
+    if (heldBtn === btn) return;
+    if (heldBtn) stop();           // switch buttons without dropping heartbeat to zeros
+    heldBtn = btn;
+    btn.classList.add("held");
+    const v = {
+      lr:  parseInt(btn.dataset.lr,  10),
+      fb:  parseInt(btn.dataset.fb,  10),
+      ud:  parseInt(btn.dataset.ud,  10),
+      yaw: parseInt(btn.dataset.yaw, 10),
+    };
+    sendManual(v.lr, v.fb, v.ud, v.yaw);
+    /* Refresh every 100 ms — interceptor's _web_manual_until is +300 ms,
+       so two consecutive drops would cut motion within 0.3 s. */
+    heartbeat = setInterval(() => sendManual(v.lr, v.fb, v.ud, v.yaw), 100);
+  }
+
+  function stop() {
+    if (!heldBtn) return;
+    heldBtn.classList.remove("held");
+    heldBtn = null;
+    clearInterval(heartbeat);
+    heartbeat = null;
+    sendManual(0, 0, 0, 0);
+  }
+
+  document.querySelectorAll(".dpad .pad-btn").forEach(btn => {
+    btn.addEventListener("mousedown",  (e) => { e.preventDefault(); start(btn); });
+    btn.addEventListener("mouseup",    stop);
+    btn.addEventListener("mouseleave", stop);
+    /* Touch: preventDefault on touchstart suppresses the synthetic mousedown. */
+    btn.addEventListener("touchstart", (e) => { e.preventDefault(); start(btn); }, { passive: false });
+    btn.addEventListener("touchend",   (e) => { e.preventDefault(); stop(); }, { passive: false });
+    btn.addEventListener("touchcancel", stop);
+  });
+  /* Safety nets: drone stops if user tabs out or window loses focus. */
+  window.addEventListener("blur", stop);
+  document.addEventListener("visibilitychange", () => { if (document.hidden) stop(); });
+}
+
+/* ----- Boot ----- */
+wireButtons();
+wireDpad();
+connectWS();
+</script>
+</body>
+</html>

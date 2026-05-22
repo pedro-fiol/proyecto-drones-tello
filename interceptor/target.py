@@ -239,13 +239,54 @@ def select_best_person(
 
 
 # ---------------------------------------------------------------------------
-# Active selection
+# Active selection — runtime-swappable
 # ---------------------------------------------------------------------------
-# Switch this constant to change tracking behavior at next session start:
-#   NOSE_TARGET               — Phase 5 face tracking (drone hovers face-height)
-#   SHOULDERS_MIDPOINT_TARGET — chest-height tracking (front ToF hits torso)
-#   EYES_MIDPOINT_TARGET      — face-height, more robust than nose alone
-#   BBOX_CENTER_TARGET        — works when person is turned away
-# Lives here (not constants.py) so target.py stays the single source of target
-# definitions without a circular import via perception.py.
-TARGET = SHOULDERS_MIDPOINT_TARGET
+# AVAILABLE_TARGETS keys are the strings the webapp dropdown sends back to
+# switch the active target at runtime. Add new Target instances here too.
+AVAILABLE_TARGETS: dict[str, Target] = {
+    "nose":               NOSE_TARGET,
+    "eyes_midpoint":      EYES_MIDPOINT_TARGET,
+    "shoulders_midpoint": SHOULDERS_MIDPOINT_TARGET,
+    "bbox_center":        BBOX_CENTER_TARGET,
+}
+
+
+class _ActiveTarget:
+    """Mutable holder around the currently active Target.
+
+    Why this wrapper exists: callers do ``from interceptor.target import TARGET``
+    and then read ``TARGET.name`` / ``TARGET.target_y_ratio`` / call
+    ``select_best_person(..., TARGET, ...)``. If TARGET were a plain module-level
+    binding, rebinding ``target.TARGET = NEW`` here would not propagate to
+    existing ``from`` imports. The wrapper keeps the same object identity while
+    its ``_inner`` attribute is swapped. All attribute access proxies through
+    __getattr__ to the inner Target, so existing code keeps working unchanged.
+    """
+
+    def __init__(self, t: Target) -> None:
+        self._inner = t
+
+    def set(self, t: Target) -> None:
+        self._inner = t
+
+    @property
+    def inner(self) -> Target:
+        return self._inner
+
+    def __getattr__(self, name: str):
+        # __getattr__ only fires when name isn't found on self — so _inner /
+        # set / inner are reached normally; everything else falls through here.
+        return getattr(self._inner, name)
+
+
+# Default at startup. Webapp /cmd/set_target can swap it at runtime.
+TARGET = _ActiveTarget(SHOULDERS_MIDPOINT_TARGET)
+
+
+def set_active_target(name: str) -> bool:
+    """Swap the active target by name. Returns True on success, False if unknown."""
+    t = AVAILABLE_TARGETS.get(name)
+    if t is None:
+        return False
+    TARGET.set(t)
+    return True

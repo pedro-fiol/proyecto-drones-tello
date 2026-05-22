@@ -12,7 +12,7 @@ from typing import Optional
 from djitellopy import Tello, TelloException
 from .pid_controller import PIDController
 from .perception import Person, PersonDetector
-from .target import TARGET, select_best_person
+from .target import TARGET, AVAILABLE_TARGETS, select_best_person, set_active_target
 
 from .constants import (
     GAINS_LEFT_RIGHT_PID, LR_MAX_VELOCITY_CM_S,
@@ -21,7 +21,7 @@ from .constants import (
     SEARCH_OPEN_SPACE_VELOCITY_CM_S,
     GRACE_RECOVERY_YAW_DEG_S, GRACE_RECOVERY_MIN_OFFSET_PX,
     TARGET_EMA_ALPHA, FB_MAX_VELOCITY_CM_S, FRAME_CENTER_X, FRAME_CENTER_Y,
-    TARGET_LOST_GRACE_S, FRONT_TOF_WALL_STOP_CM, FRONT_TOF_DISCONTINUITY_FREEZE_S,
+    TARGET_LOST_GRACE_S, LOCK_LOST_TIMEOUT_S, FRONT_TOF_WALL_STOP_CM, FRONT_TOF_DISCONTINUITY_FREEZE_S,
     FRONT_TOF_INVALID_HYSTERESIS_FRAMES, TRACKING_MISS_HYSTERESIS_FRAMES,
     SEARCH_ADVANCE_MAX_DISTANCE_CM,
     SEARCH_ADVANCE_SWEEP_EVERY_S, SEARCH_ADVANCE_SWEEP_YAW_DEG_S,
@@ -33,6 +33,7 @@ from .constants import (
     MANUAL_UD_VELOCITY_CM_S, MANUAL_YAW_VELOCITY_DEG_S,
     MAX_TRACKING_ALTITUDE_CM, MIN_TRACKING_ALTITUDE_CM,
     RC_LOOP_INTERVAL_S, TARGET_ALTITUDE_CM, UD_MAX_VELOCITY_CM_S, YAW_MAX_VELOCITY_CM_S,
+    WEB_MANUAL_HEARTBEAT_GRACE_S,
     YOLO_FRAME_STRIDE,
 )
 
@@ -163,6 +164,9 @@ class TelloInterceptor:
         # only returns detections with this id — drone refuses to swap onto strangers.
         # Lock survives across hover/search modes. Manually re-set via 'i' if track lost.
         self._locked_track_id: Optional[int] = None
+        # Timestamp of last frame where locked id was found. Used to auto-clear the
+        # lock after LOCK_LOST_TIMEOUT_S so re-id failures don't dead-lock the drone.
+        self._locked_last_seen_time: float = 0.0
 
         # EMA-smoothed closeness signal for bbox pitch PID. Same TARGET_EMA_ALPHA as
         # target x/y — closeness is computed from raw detection, jitters per frame.
@@ -244,6 +248,116 @@ class TelloInterceptor:
         self._advance_last_sweep_t: float = 0.0
         self._advance_distance_cm: float = 0.0
         self._advance_sweep_obstacle: bool = False
+
+        # ---- Webapp integration ----
+        # latest_frame: last annotated BGR frame from _video_loop. FastAPI MJPEG
+        # endpoint reads this each tick, encodes JPEG, streams. None until first frame.
+        # current_mode_label: mirrors mode_label local var so web telemetry can show it.
+        # _web_*_pending: one-shot intent flags set by web_request_* methods. Consumed
+        # by _video_loop each tick by OR-ing into the matching keyboard rising_edge,
+        # so web and keyboard share the same downstream logic. No duplication.
+        self.latest_frame = None
+        self.current_mode_label: str = "init"
+        self._web_takeoff_land_pending: bool = False
+        self._web_toggle_manual_pending: bool = False
+        self._web_enroll_pending: bool = False
+        self._web_clear_lock_pending: bool = False
+
+        # Web manual control: heartbeat timestamp. web_set_manual_velocity()
+        # pushes this 0.3s into the future on each call. _poll_keyboard keeps
+        # the web-set manual_* values as long as now < _web_manual_until AND
+        # no keyboard key is pressed. Browser tab dies → no heartbeat → values
+        # zero within 0.3s → drone stops. Safety: never hangs on stale velocity.
+        self._web_manual_until: float = 0.0
+
+    # ---- Webapp control surface ----
+    # All four return immediately. _video_loop consumes the flag next tick.
+    def web_request_takeoff_land(self) -> None:
+        """Toggle takeoff/land — same effect as pressing SPACE."""
+        self._web_takeoff_land_pending = True
+
+    def web_request_toggle_manual(self) -> None:
+        """Toggle manual keyboard mode — same effect as pressing M."""
+        self._web_toggle_manual_pending = True
+
+    def web_request_enroll(self) -> None:
+        """Lock / cycle target — same effect as pressing I."""
+        self._web_enroll_pending = True
+
+    def web_request_clear_lock(self) -> None:
+        """Clear identity lock — same effect as pressing C."""
+        self._web_clear_lock_pending = True
+
+    def web_request_stop(self) -> None:
+        """Trigger clean shutdown — same effect as pressing ESC."""
+        self.video_active = False
+
+    def web_set_target(self, name: str) -> bool:
+        """Swap the active tracking target at runtime. Returns False on unknown name.
+
+        Reset PIDs + EMA state because the new target has a different
+        target_y_ratio + closeness scale; reusing prior integral / smoothed
+        values would produce an immediate spike.
+        """
+        ok = set_active_target(name)
+        if not ok:
+            return False
+        # Wipe smoothed + PID state so the switch doesn't pop the controller.
+        self.altitude_target_pid.reset_integral()
+        self.yaw_pid.reset_integral()
+        self.pitch_pid.reset_integral()
+        self.pitch_bbox_pid.reset_integral()
+        self.roll_pid.reset_integral()
+        self._target_ema_initialized = False
+        self._closeness_ema_initialized = False
+        self._bbox_ema_initialized = False
+        return True
+
+    def web_set_manual_velocity(self, lr: int, fb: int, ud: int, yaw: int) -> None:
+        """Set manual RC velocity from web dpad. Requires is_manual=True to take effect.
+
+        Each call refreshes the heartbeat by WEB_MANUAL_HEARTBEAT_S. Frontend
+        is expected to call this every ~100 ms while a dpad button is held,
+        and call once with all zeros on release. If the browser dies the
+        heartbeat lapses and _poll_keyboard zeros the velocities.
+        """
+        self.manual_lr  = int(lr)
+        self.manual_fb  = int(fb)
+        self.manual_ud  = int(ud)
+        self.manual_yaw = int(yaw)
+        self._web_manual_until = time.time() + WEB_MANUAL_HEARTBEAT_GRACE_S
+
+    def web_get_telemetry(self) -> dict:
+        """Snapshot of all telemetry + RC state. Called by WS push loop."""
+        return {
+            "mode":            self.current_mode_label,
+            "phantom_mode":    self.phantom_mode,
+            "is_airborne":     self._is_airborne,
+            "is_manual":       self.is_manual,
+            "battery_percent": self.battery_percent,
+            "front_tof_cm":    self.front_tof_cm,
+            "down_tof_cm":     self.down_tof_cm,
+            "height_cm":       self.height_cm,
+            "pitch_deg":       self.pitch_deg,
+            "roll_deg":        self.roll_deg,
+            "yaw_deg":         self.yaw_deg,
+            "vx_dm_s":         self.x_speed_dm_s,
+            "vy_dm_s":         self.y_speed_dm_s,
+            "vz_dm_s":         self.z_speed_dm_s,
+            "ax_cm_s2":        self.x_accel_cm_s2,
+            "ay_cm_s2":        self.y_accel_cm_s2,
+            "az_cm_s2":        self.z_accel_cm_s2,
+            "temp_min_c":      self.min_temp_C,
+            "temp_max_c":      self.max_temp_C,
+            "rc_lr":           self.rc[0],
+            "rc_fb":           self.rc[1],
+            "rc_ud":           self.rc[2],
+            "rc_yaw":          self.rc[3],
+            "locked_track_id": self._locked_track_id,
+            "search_state":    self._search_state,
+            "target_name":     getattr(TARGET, "name", "—"),
+            "available_targets": list(AVAILABLE_TARGETS.keys()),
+        }
 
     """
     Starts drone connection, video stream, and all threads.
@@ -455,6 +569,9 @@ class TelloInterceptor:
         while self.video_active:
             # leer cada frame del stream de video
             current_frame = drone_video.frame
+            # djitellopy returns RGB (PyAV default); cv2 and YOLO expect BGR.
+            if current_frame is not None:
+                current_frame = cv2.cvtColor(current_frame, cv2.COLOR_RGB2BGR)
 
             """
             Handle missing frames
@@ -513,7 +630,37 @@ class TelloInterceptor:
             best_person = select_best_person(
                 detected_persons, TARGET, last_point_px, self._locked_track_id
             )
+
+            # Auto-clear lock if locked track_id missing > LOCK_LOST_TIMEOUT_S.
+            # BoT-SORT reassigns ids on re-id failures, so stale lock would block
+            # all detections forever. Reset timer whenever locked id matched.
+            if self._locked_track_id is not None:
+                locked_present = any(p.track_id == self._locked_track_id for p in detected_persons)
+                if locked_present:
+                    self._locked_last_seen_time = time.time()
+                elif self._locked_last_seen_time > 0 and (time.time() - self._locked_last_seen_time) > LOCK_LOST_TIMEOUT_S:
+                    print(f"[ENROLL] Lock #{self._locked_track_id} stale > {LOCK_LOST_TIMEOUT_S}s — auto-clearing.")
+                    self._locked_track_id = None
+                    self._locked_last_seen_time = 0.0
+                    # Re-run selection without the dead lock so this frame still tracks.
+                    best_person = select_best_person(
+                        detected_persons, TARGET, last_point_px, None
+                    )
+
             persons_to_draw = [best_person] if best_person is not None else []
+
+            # Build web frame BEFORE HUD overlays land on current_frame.
+            # Reuses draw_person_overlays so bbox color + target-name label match
+            # the cv2 window exactly. Adds LOCK badge for the locked id. Skips
+            # telemetry strip, crosshair, mode badge — dashboard already shows that.
+            web_frame = current_frame.copy()
+            draw_person_overlays(web_frame, persons_to_draw, TARGET)
+            if self._locked_track_id is not None:
+                for p in persons_to_draw:
+                    if p.track_id == self._locked_track_id:
+                        cv2.putText(web_frame, f"LOCK #{p.track_id}",
+                                    (p.x1, p.y2 + 22),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
             """
             HUD overlays
@@ -590,8 +737,26 @@ class TelloInterceptor:
             error_roll = 0.0
             roll_inside_bbox = 0
 
+            # Grounded -> skip autonomous FSM. No PID, no search spin. RC stays 0.
+            # Phantom mode dry-runs the FSM, so don't gate on airborne there.
+            if not self._is_airborne and not self.phantom_mode:
+                mode_label = "grounded"
+                error_altitude = 0.0
+                error_yaw = 0.0
+                error_pitch = 0.0
+                self._search_state = "none"
+                self.altitude_pid.reset_integral()
+                self.altitude_target_pid.reset_integral()
+                self.yaw_pid.reset_integral()
+                self.pitch_pid.reset_integral()
+                self.pitch_bbox_pid.reset_integral()
+                self.roll_pid.reset_integral()
+                self._target_ema_initialized = False
+                self._closeness_ema_initialized = False
+                self._bbox_ema_initialized = False
+
             # Target visible -> INTERCEPTING mode
-            if tracking_target:
+            elif tracking_target:
                 # Refresh only on raw detection so grace timer measures true loss duration.
                 if tracking_target_raw:
                     self._last_target_seen_time = time.time()
@@ -975,7 +1140,12 @@ class TelloInterceptor:
             # Latch pitch source for next-frame transition detection (D-term seeding).
             self._pitch_source_last = pitch_source
 
-           
+            # Expose minimal web frame (bbox + conf + lock only) for webapp.
+            # cv2.imshow below uses fully-annotated current_frame.
+            # Single-attr assignment is atomic in CPython, no lock needed.
+            self.latest_frame = web_frame
+            self.current_mode_label = mode_label
+
             cv2.imshow("TelloInterceptor", current_frame)
             # Pump cv2 render. _poll_keyboard() drains key messages so cv2
             # doesn't freeze when a movement key is held.
@@ -1018,6 +1188,17 @@ class TelloInterceptor:
                                 else:
                                     self.tello.takeoff()
                                     self._is_airborne = True
+                                    # Zero manual sticks + wipe PID integrals so whichever
+                                    # mode is active post-takeoff (auto or manual) starts
+                                    # clean. Mode itself preserved — operator picks before
+                                    # takeoff and that choice stands.
+                                    self.manual_lr = self.manual_fb = self.manual_ud = self.manual_yaw = 0
+                                    self.altitude_pid.reset_integral()
+                                    self.altitude_target_pid.reset_integral()
+                                    self.yaw_pid.reset_integral()
+                                    self.pitch_pid.reset_integral()
+                                    self.pitch_bbox_pid.reset_integral()
+                                    self.roll_pid.reset_integral()
                         except TelloException as e:
                             # Do NOT touch _is_airborne here. The successful-path assignment
                             # only runs if the SDK call returned. If it raised, the flag is
@@ -1054,6 +1235,7 @@ class TelloInterceptor:
                         current_index = ids_sorted.index(self._locked_track_id)
                         new_id = ids_sorted[(current_index + 1) % len(ids_sorted)]
                     self._locked_track_id = new_id
+                    self._locked_last_seen_time = time.time()
                     print(f"[ENROLL] Locked track_id={new_id} (rank {ids_sorted.index(new_id) + 1}/{len(ids_sorted)})")
 
             # C — clear lock. Drone falls back to nearest/largest selection.
@@ -1084,26 +1266,55 @@ class TelloInterceptor:
         self._i_was_pressed     = i_now
         self._c_was_pressed     = c_now
 
+        # Web overrides: OR pending intent flags into rising edges. Web and keyboard
+        # share the same downstream handler logic. Clear after OR so a held flag
+        # doesn't fire every tick.
+        if self._web_takeoff_land_pending:
+            self._space_rising_edge = True
+            self._web_takeoff_land_pending = False
+        if self._web_toggle_manual_pending:
+            self._m_rising_edge = True
+            self._web_toggle_manual_pending = False
+        if self._web_enroll_pending:
+            self._i_rising_edge = True
+            self._web_enroll_pending = False
+        if self._web_clear_lock_pending:
+            self._c_rising_edge = True
+            self._web_clear_lock_pending = False
+
         if not self.is_manual:
             self.manual_lr = self.manual_fb = self.manual_ud = self.manual_yaw = 0
             return
 
-        self.manual_fb = (
-             MANUAL_FB_VELOCITY_CM_S  if _is_key_pressed(_VK_W) else
-            -MANUAL_FB_VELOCITY_CM_S  if _is_key_pressed(_VK_S) else 0
-        )
-        self.manual_lr = (
-            -MANUAL_LR_VELOCITY_CM_S  if _is_key_pressed(_VK_A) else
-             MANUAL_LR_VELOCITY_CM_S  if _is_key_pressed(_VK_D) else 0
-        )
-        self.manual_yaw = (
-            -MANUAL_YAW_VELOCITY_DEG_S if _is_key_pressed(_VK_Q) else
-             MANUAL_YAW_VELOCITY_DEG_S if _is_key_pressed(_VK_E) else 0
-        )
-        self.manual_ud = (
-             MANUAL_UD_VELOCITY_CM_S  if _is_key_pressed(_VK_UP)   else
-            -MANUAL_UD_VELOCITY_CM_S  if _is_key_pressed(_VK_DOWN) else 0
-        )
+        # Keyboard wins if any movement key held — operator at the PC has
+        # immediate priority. Otherwise the web dpad's last values stand for
+        # as long as its heartbeat is fresh. Otherwise zero (idle).
+        kb_any = any(_is_key_pressed(k) for k in (
+            _VK_W, _VK_S, _VK_A, _VK_D, _VK_Q, _VK_E, _VK_UP, _VK_DOWN,
+        ))
+        if kb_any:
+            self.manual_fb = (
+                 MANUAL_FB_VELOCITY_CM_S  if _is_key_pressed(_VK_W) else
+                -MANUAL_FB_VELOCITY_CM_S  if _is_key_pressed(_VK_S) else 0
+            )
+            self.manual_lr = (
+                -MANUAL_LR_VELOCITY_CM_S  if _is_key_pressed(_VK_A) else
+                 MANUAL_LR_VELOCITY_CM_S  if _is_key_pressed(_VK_D) else 0
+            )
+            self.manual_yaw = (
+                -MANUAL_YAW_VELOCITY_DEG_S if _is_key_pressed(_VK_Q) else
+                 MANUAL_YAW_VELOCITY_DEG_S if _is_key_pressed(_VK_E) else 0
+            )
+            self.manual_ud = (
+                 MANUAL_UD_VELOCITY_CM_S  if _is_key_pressed(_VK_UP)   else
+                -MANUAL_UD_VELOCITY_CM_S  if _is_key_pressed(_VK_DOWN) else 0
+            )
+        elif time.time() < self._web_manual_until:
+            # Web heartbeat fresh — leave manual_* as web_set_manual_velocity set them.
+            pass
+        else:
+            # Both idle. Stop drone.
+            self.manual_lr = self.manual_fb = self.manual_ud = self.manual_yaw = 0
 
     def _update_front_tof(self):
     
@@ -1174,7 +1385,7 @@ class TelloInterceptor:
         and shows in HUD, but never reaches the drone.
         """
         while self.rc_loop_active:
-            if not self.phantom_mode:
+            if not self.phantom_mode and self._is_airborne:
                 with self._sdk_lock:
                     self.tello.send_rc_control(*self.rc)
             time.sleep(RC_LOOP_INTERVAL_S)  # 0.05 s → 20 Hz
