@@ -12,7 +12,11 @@ from typing import Optional
 from djitellopy import Tello, TelloException
 from .pid_controller import PIDController
 from .perception import Person, PersonDetector
-from .target import TARGET, AVAILABLE_TARGETS, select_best_person, set_active_target
+from .target import (
+    TARGET, AVAILABLE_TARGETS, LockState,
+    select_best_person, select_target_person, set_active_target,
+)
+from .reid import ReidEmbedder, crop_bbox
 
 from .constants import (
     GAINS_LEFT_RIGHT_PID, LR_MAX_VELOCITY_CM_S,
@@ -29,6 +33,7 @@ from .constants import (
     GAINS_ALTITUDE_PID, GAINS_ALTITUDE_TARGET_PID,
     GAINS_FORWARD_BACK_TOF_PID, GAINS_FORWARD_BACK_BBOX_PID, GAINS_YAW_PID,
     INTERCEPT_DISTANCE_CM,
+    LOCK_MATCH_THRESHOLD,
     MANUAL_FB_VELOCITY_CM_S, MANUAL_LR_VELOCITY_CM_S,
     MANUAL_UD_VELOCITY_CM_S, MANUAL_YAW_VELOCITY_DEG_S,
     MAX_TRACKING_ALTITUDE_CM, MIN_TRACKING_ALTITUDE_CM,
@@ -132,7 +137,37 @@ class TelloInterceptor:
         self.max_temp_C = -1.0
 
         self.person_detector = PersonDetector(device=DEVICE)
-        
+
+        # ---- Multi-target lock (Phase 8) ----
+        # ReidEmbedder loads OSNet x0_25 + MSMT17 weights on first run (auto-
+        # download via gdown). If load fails (no GPU / weights download error)
+        # the lock feature degrades to unavailable but the drone still flies
+        # normally (unlocked = biggest-bbox tracking, identical to prior behavior).
+        try:
+            self.reid: Optional[ReidEmbedder] = ReidEmbedder(device=DEVICE)
+        except Exception as exc:
+            print(f"[WARN] ReidEmbedder init failed; lock feature disabled: {exc}")
+            self.reid = None
+
+        self.lock = LockState()
+
+        # Pending intent flags from keyboard / webapp. Consumed once each video
+        # tick. Mirrors the existing _web_*_pending pattern.
+        # _lock_pending_at = (x_norm, y_norm) — click in video frame, lock the
+        # person whose bbox contains that point.
+        # _lock_pending_cycle — `I` key: lock biggest bbox if unlocked, else
+        # advance lock to next detection in left-to-right order.
+        # _lock_pending_clear — `C` key or web button: drop lock back to
+        # biggest-bbox default.
+        self._lock_pending_at: Optional[tuple[float, float]] = None
+        self._lock_pending_cycle: bool = False
+        self._lock_pending_clear: bool = False
+
+        # Most recent lock match diagnostics (for telemetry + HUD).
+        self._last_lock_distance: float = -1.0
+        self._last_lock_idx: Optional[int] = None
+        self._last_persons_count: int = 0
+
         # Actuation
         self.rc_loop_active = False
         self.altitude_pid = PIDController(*GAINS_ALTITUDE_PID, output_min=-UD_MAX_VELOCITY_CM_S, output_max=UD_MAX_VELOCITY_CM_S)
@@ -278,6 +313,18 @@ class TelloInterceptor:
         """Clear identity lock — same effect as pressing C."""
         self._web_clear_lock_pending = True
 
+    def web_lock_at(self, x_norm: float, y_norm: float) -> None:
+        """Lock onto the detection at (x_norm, y_norm) on the next video tick.
+
+        Coordinates are normalized [0, 1] relative to the displayed video
+        frame — the browser computes them from a click event on the <img>
+        feed. The video loop translates to pixel coords and finds the bbox
+        containing that point.
+        """
+        x = max(0.0, min(1.0, float(x_norm)))
+        y = max(0.0, min(1.0, float(y_norm)))
+        self._lock_pending_at = (x, y)
+
     def web_request_stop(self) -> None:
         """Trigger clean shutdown — same effect as pressing ESC."""
         self.video_active = False
@@ -343,7 +390,16 @@ class TelloInterceptor:
             "rc_fb":           self.rc[1],
             "rc_ud":           self.rc[2],
             "rc_yaw":          self.rc[3],
-            "locked_track_id": None,
+            # locked_track_id: 0 = locked (no real per-track ID since YOLO is
+            # stateless; the lock is identity-by-embedding, not by index).
+            # Frontend treats non-null as "locked" and switches the video
+            # glow accordingly.
+            "locked_track_id": 0 if self.lock.is_locked else None,
+            "lock_distance":   self._last_lock_distance,
+            "lock_threshold":  LOCK_MATCH_THRESHOLD,
+            "lock_target_idx": self._last_lock_idx,
+            "num_detections":  self._last_persons_count,
+            "reid_available":  self.reid is not None,
             "search_state":    self._search_state,
             "target_name":     getattr(TARGET, "name", "—"),
             "available_targets": list(AVAILABLE_TARGETS.keys()),
@@ -606,27 +662,118 @@ class TelloInterceptor:
             if frame_count % YOLO_FRAME_STRIDE == 0:
                 detected_persons = self.person_detector.detect_persons_in_frame(current_frame)
 
-            # Single-person lock: while EMA initialized (drone is currently tracking
-            # someone), select nearest-to-last detection. EMA gets cleared in hover/search
-            # branches → next acquire falls back to largest-bbox. This pins identity for
-            # the duration of a continuous track and re-locks cleanly after a true loss.
+            # ---- Multi-target lock pipeline ----
+            # 1) Embed every detection (one batched forward pass on the ReID model).
+            #    Cheap on CUDA (~3 ms / person for OSNet x0_25). Skipped when the
+            #    embedder failed to init or no detections this frame.
+            # 2) Apply any pending lock intents from keyboard / webapp (I, C, click)
+            #    so the lock state reflects the operator's latest action BEFORE
+            #    selection — no one-frame delay between click and visible lock.
+            # 3) select_target_person picks the chosen person via cosine distance
+            #    when locked, or biggest-bbox / nearest-to-last when unlocked.
+            # 4) On a successful match, EMA-blend the new embedding into the lock
+            #    so slow appearance drift (pose, lighting) doesn't break identity.
+
+            embeddings = None
+            if self.reid is not None and detected_persons:
+                crops = [
+                    crop_bbox(current_frame, p.x1, p.y1, p.x2, p.y2)
+                    for p in detected_persons
+                ]
+                # Filter out None crops while keeping index alignment with detected_persons.
+                # crop_bbox returns None only for degenerate bboxes (zero area after clamp).
+                # If any crop is None, fall back to no-embedding for safety.
+                if all(c is not None for c in crops):
+                    try:
+                        embeddings = self.reid.embed_batch(crops)
+                    except Exception as exc:
+                        print(f"[WARN] ReID embed_batch failed; skipping lock match: {exc}")
+                        embeddings = None
+
+            # --- Apply pending lock intents ---
+            if self._lock_pending_clear:
+                self.lock.clear()
+                self._lock_pending_clear = False
+
+            if self._lock_pending_at is not None and embeddings is not None and detected_persons:
+                x_norm, y_norm = self._lock_pending_at
+                click_px = int(x_norm * w)
+                click_py = int(y_norm * h)
+                hit_idx: Optional[int] = None
+                for idx, p in enumerate(detected_persons):
+                    if p.x1 <= click_px <= p.x2 and p.y1 <= click_py <= p.y2:
+                        hit_idx = idx
+                        break
+                if hit_idx is not None:
+                    center = (float(detected_persons[hit_idx].bbox_center_x),
+                              float(detected_persons[hit_idx].bbox_center_y))
+                    self.lock.lock_from(embeddings[hit_idx], center)
+                    print(f"[INFO] Lock at ({click_px},{click_py}) -> person #{hit_idx}")
+                else:
+                    print(f"[INFO] Lock click at ({click_px},{click_py}) hit no bbox")
+                self._lock_pending_at = None
+
+            if self._lock_pending_cycle and embeddings is not None and detected_persons:
+                # Left-to-right cycle order keeps cycling predictable across frames.
+                order = sorted(
+                    range(len(detected_persons)),
+                    key=lambda i: detected_persons[i].bbox_center_x,
+                )
+                if not self.lock.is_locked:
+                    # Unlocked → lock onto biggest bbox (matches user's "no-lock" baseline).
+                    target_idx = max(
+                        range(len(detected_persons)),
+                        key=lambda i: detected_persons[i].bbox_area_pixels,
+                    )
+                else:
+                    # Locked → advance to next person in left-to-right order.
+                    locked_vec = self.lock.embedding.flatten()
+                    sims = embeddings @ locked_vec
+                    import torch as _torch
+                    current_idx = int(_torch.argmax(sims).item())
+                    pos_in_order = order.index(current_idx) if current_idx in order else 0
+                    target_idx = order[(pos_in_order + 1) % len(order)]
+                center = (float(detected_persons[target_idx].bbox_center_x),
+                          float(detected_persons[target_idx].bbox_center_y))
+                self.lock.lock_from(embeddings[target_idx], center)
+                print(f"[INFO] Lock cycle -> person #{target_idx}")
+                self._lock_pending_cycle = False
+
+            # --- Selection ---
             last_point_px = (
                 (self._target_smoothed_x_px, self._target_smoothed_y_px)
                 if self._target_ema_initialized else None
             )
-            best_person = select_best_person(detected_persons, TARGET, last_point_px)
+            best_person, best_idx, lock_dist = select_target_person(
+                detected_persons, TARGET, self.lock, embeddings, last_point_px,
+            )
+            self._last_persons_count = len(detected_persons)
+            self._last_lock_distance = lock_dist
+            self._last_lock_idx = best_idx
 
-            persons_to_draw = [best_person] if best_person is not None else []
+            # EMA-update the locked embedding on a confirmed match. Updating only
+            # when the match passed the threshold ensures the fingerprint can't
+            # drift onto a different person from a false positive.
+            if (self.lock.is_locked and best_person is not None
+                    and best_idx is not None and embeddings is not None):
+                self.lock.update(
+                    embeddings[best_idx],
+                    (float(best_person.bbox_center_x), float(best_person.bbox_center_y)),
+                )
+
+            persons_to_draw = detected_persons  # draw all detections, mark the chosen one
 
             # Build web frame BEFORE HUD overlays land on current_frame.
             web_frame = current_frame.copy()
-            draw_person_overlays(web_frame, persons_to_draw, TARGET)
+            draw_person_overlays(web_frame, persons_to_draw, TARGET,
+                                 chosen_idx=best_idx, locked=self.lock.is_locked)
 
             """
             HUD overlays
             """
             target_x_px, target_y_px, tracking_target, tracked_person = draw_person_overlays(
-                current_frame, persons_to_draw, TARGET
+                current_frame, persons_to_draw, TARGET,
+                chosen_idx=best_idx, locked=self.lock.is_locked,
             )
 
             draw_frame_crosshair(current_frame, frame_center_x, frame_center_y)
@@ -1181,9 +1328,17 @@ class TelloInterceptor:
                 self.pitch_bbox_pid.reset_integral()
                 self.roll_pid.reset_integral()
 
-            # I / C — lock feature disabled (BoT-SORT + ReID removed).
-            if self._i_rising_edge or self._c_rising_edge:
-                print("[WARN] Lock feature disabled.")
+            # I — lock-cycle. Unlocked: lock biggest bbox. Locked: advance to
+            # next person in left-to-right order. Actual application happens
+            # at the top of the next video tick where embeddings are fresh.
+            # C — clear lock back to biggest-bbox default behavior.
+            if self._i_rising_edge:
+                if self.reid is None:
+                    print("[WARN] ReID embedder unavailable; lock disabled.")
+                else:
+                    self._lock_pending_cycle = True
+            if self._c_rising_edge:
+                self._lock_pending_clear = True
 
         cv2.destroyAllWindows()
 

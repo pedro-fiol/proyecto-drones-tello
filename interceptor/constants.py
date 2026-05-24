@@ -128,6 +128,28 @@ RC_LOOP_INTERVAL_S          = 0.05   # 20 Hz
 WEB_MANUAL_HEARTBEAT_GRACE_S = 0.6
 
 
+# ---- ReID (Phase 8: multi-target lock) ----
+# Backbone + weights. OSNet x0_25 trained on MSMT17 — small (~3MB), fast (~3ms/crop GPU),
+# and trained on the most varied person-ReID dataset available so it generalizes to
+# indoor drone footage. Weights file is downloaded on first run via gdown.
+REID_MODEL_NAME            = "osnet_x0_25"
+REID_WEIGHTS_PATH          = "models/osnet_x0_25_msmt17.pt"
+REID_WEIGHTS_GDRIVE_ID     = "1Kkx2zW89jq_NETu4u42CFZTMVD5Hwm6e"  # osnet_x0_25_msmt17 (torchreid model zoo)
+REID_INPUT_SIZE_HW         = (256, 128)             # ReID standard input
+REID_PIXEL_MEAN            = (0.485, 0.456, 0.406)  # ImageNet normalization
+REID_PIXEL_STD             = (0.229, 0.224, 0.225)
+
+# Lock match: cosine distance threshold. Below = same person, above = different.
+# 0.30 is a sane default for OSNet on MSMT17 — typical same-person dist 0.05-0.20,
+# typical cross-person dist 0.35-0.70. Tune via lock_response.csv log if needed.
+LOCK_MATCH_THRESHOLD       = 0.30
+
+# Lock-time EMA on locked embedding. Each frame the locked target is matched,
+# embedding moves alpha toward the new sample. Absorbs slow pose/lighting drift
+# without losing identity. alpha=0.05 → ~20-frame time constant.
+LOCK_EMBEDDING_EMA_ALPHA   = 0.05
+
+
 # ---- Target tracking (Phase 6a) ----
 # Closeness setpoints used by the pitch fallback PID when front ToF is invalid.
 # Each Target picks one of these via target.closeness_setpoint. Higher closeness =

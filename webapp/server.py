@@ -64,6 +64,15 @@ class TargetCommand(BaseModel):
     name: str = Field(..., min_length=1, max_length=64)
 
 
+class LockAtCommand(BaseModel):
+    """Click-to-lock on the video. Coordinates are normalized 0..1 against the
+    displayed frame (origin top-left). The frontend computes them from a click
+    event on the <img class="feed"> element so the math is independent of any
+    CSS scaling the browser applied."""
+    x: float = Field(..., ge=0.0, le=1.0)
+    y: float = Field(..., ge=0.0, le=1.0)
+
+
 def build_app(interceptor) -> FastAPI:
     """Wire all routes against a live TelloInterceptor instance."""
     app = FastAPI(title="Tello Interceptor")
@@ -129,6 +138,18 @@ def build_app(interceptor) -> FastAPI:
             from fastapi import HTTPException
             raise HTTPException(status_code=400, detail=f"unknown target: {cmd.name}")
         return {"ok": True, "name": cmd.name}
+
+    @app.post("/cmd/lock_target")
+    def cmd_lock_target(cmd: LockAtCommand):
+        """Click-to-lock. Queues a lock intent for the next video tick.
+
+        Returns immediately; the interceptor's video loop translates (x, y) to
+        pixel coords, finds the bbox containing that point, and locks the
+        ReID embedding from that crop. If no bbox contains the click, the
+        request silently no-ops (logged at the interceptor side).
+        """
+        interceptor.web_lock_at(cmd.x, cmd.y)
+        return {"ok": True}
 
     @app.post("/cmd/manual_set")
     def cmd_manual_set(cmd: ManualCommand):

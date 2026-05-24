@@ -333,6 +333,7 @@
     height: 100%;
     object-fit: contain;
     display: block;
+    cursor: crosshair;  /* signal that the video is clickable for lock */
   }
   .video.locked  { box-shadow: inset 0 0 0 2px rgba(0,182,90,.55), inset 0 0 60px rgba(0,182,90,.18); }
   .video.lost    { box-shadow: inset 0 0 0 2px rgba(255,138,0,.55), inset 0 0 60px rgba(255,138,0,.16); }
@@ -1308,7 +1309,14 @@ function applyTelemetry(t) {
   pPh.className = "pill" + (t.phantom_mode ? "" : " ok");
 
   /* Lock / target / mode kv */
-  $("lock-id").textContent = t.locked_track_id == null ? "—" : ("#" + t.locked_track_id);
+  if (t.locked_track_id == null) {
+    $("lock-id").textContent = "—";
+  } else {
+    const idx = (t.lock_target_idx == null) ? "?" : t.lock_target_idx;
+    const dist = (typeof t.lock_distance === "number" && t.lock_distance >= 0)
+      ? ("  d=" + t.lock_distance.toFixed(2)) : "";
+    $("lock-id").textContent = "LOCKED #" + idx + dist;
+  }
   syncTargetSelect(t.available_targets, t.target_name);
   $("search-st").textContent = t.search_state || "—";
   $("mode-txt").textContent = t.mode || "—";
@@ -1585,9 +1593,65 @@ function wireDpad() {
   document.addEventListener("visibilitychange", () => { if (document.hidden) stop(); });
 }
 
+/* ----- Click-to-lock on video -----
+ * Click anywhere on the live feed; if the click landed inside a detected
+ * person's bbox the interceptor locks onto that person via ReID embedding.
+ * The video is object-fit: contain, so the rendered image may have letterbox
+ * bars on either axis — we convert click coords into the actual image rect
+ * before normalizing to 0..1.
+ */
+function feedClickToNorm(e, img) {
+  const rect = img.getBoundingClientRect();
+  const cx = e.clientX - rect.left;
+  const cy = e.clientY - rect.top;
+  const nw = img.naturalWidth || 960;
+  const nh = img.naturalHeight || 720;
+  const containerAspect = rect.width / rect.height;
+  const imageAspect = nw / nh;
+  let displayW, displayH, offX, offY;
+  if (containerAspect > imageAspect) {
+    /* container wider than image → letterbox on sides */
+    displayH = rect.height;
+    displayW = displayH * imageAspect;
+    offX = (rect.width - displayW) / 2;
+    offY = 0;
+  } else {
+    displayW = rect.width;
+    displayH = displayW / imageAspect;
+    offX = 0;
+    offY = (rect.height - displayH) / 2;
+  }
+  const ix = cx - offX;
+  const iy = cy - offY;
+  if (ix < 0 || iy < 0 || ix > displayW || iy > displayH) return null;
+  return { x: ix / displayW, y: iy / displayH };
+}
+
+async function sendLockAt(x, y) {
+  try {
+    const r = await fetch("/cmd/lock_target", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ x, y }),
+    });
+    if (!r.ok) console.error("lock_target rejected:", await r.text());
+  } catch (err) { console.error(err); }
+}
+
+function wireFeedClick() {
+  const img = $("feed");
+  if (!img) return;
+  img.addEventListener("click", (e) => {
+    const n = feedClickToNorm(e, img);
+    if (n == null) return;
+    sendLockAt(n.x, n.y);
+  });
+}
+
 /* ----- Boot ----- */
 wireButtons();
 wireDpad();
+wireFeedClick();
 connectWS();
 </script>
 </body>

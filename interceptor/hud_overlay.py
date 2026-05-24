@@ -35,49 +35,99 @@ COLOR_TELEMETRY_SECONDARY = (150, 150, 255)
 COLOR_MANUAL_BADGE = (0, 220, 255)    # yellow-ish
 COLOR_AUTO_BADGE = (180, 180, 180)    # grey
 
+# Multi-target lock palette
+COLOR_DECOY_BOX = (140, 140, 140)     # grey — non-chosen detections
+COLOR_LOCKED_BOX = (0, 220, 255)      # bright yellow — locked + matched
+COLOR_LOCK_LABEL = (0, 0, 0)          # black text on yellow background
+
 
 def draw_person_overlays(
     frame: np.ndarray,
     persons: "list[Person]",
     target: "Target",
+    chosen_idx: Optional[int] = None,
+    locked: bool = False,
 ) -> tuple:
     """
     Draw bbox + label + target dot for every detected person.
 
-    Returns (target_x, target_y, tracking, tracked_person):
-        target_x, target_y — pixel coords of the active target on the chosen
-            person, or (None, None) when no person passes target.is_visible.
-        tracking — True when at least one person passed target.is_visible.
-        tracked_person — the Person whose target is active (for tracking),
-            or the first body bbox as fallback (for bbox-PID closeness signal),
-            or None if no persons at all.
+    With multi-target lock, all detections are drawn:
+      * chosen_idx (the active tracking target) gets the full-color (or
+        yellow-locked) thick box plus the target point dot;
+      * all other detections get a thin grey "decoy" box so the operator
+        can see candidates but knows which one the drone is tracking.
 
-    Visible-target persons take priority over body-only ones for `tracked_person`.
+    Args:
+        frame: BGR HxWx3 uint8 array, drawn in-place.
+        persons: every YOLO detection this frame.
+        target: active Target (visibility predicate + point extractor).
+        chosen_idx: index into `persons` of the person being tracked, or
+            None when nothing is being tracked (unlocked + no detections, or
+            locked + no match this frame). When None, every person is drawn
+            as a decoy.
+        locked: True when LockState.is_locked. Changes the chosen bbox to the
+            yellow LOCK palette so the operator sees the lock is engaged
+            even between matches.
+
+    Returns (target_x, target_y, tracking, tracked_person):
+        target_x, target_y — pixel coords of the active target point on the
+            chosen person, or (None, None) when nothing's chosen / chosen
+            person's target isn't visible (fallback to bbox center then).
+        tracking — True when chosen_idx is not None AND target.is_visible
+            on persons[chosen_idx]. Mirrors prior single-person semantics.
+        tracked_person — persons[chosen_idx] or None. Orchestrator uses this
+            for pitch-PID closeness signal.
     """
     target_x: Optional[int] = None
     target_y: Optional[int] = None
     tracking = False
     tracked_person: Optional["Person"] = None
 
-    for person in persons:
-        if target.is_visible(person):
-            color = COLOR_FACE_BOX
-            label = f"{target.name.upper()} {person.bbox_confidence:.2f}"
-            target_x, target_y = target.point(person)
-            tracking = True
+    for idx, person in enumerate(persons):
+        is_chosen = (chosen_idx is not None and idx == chosen_idx)
+
+        if is_chosen:
+            if locked:
+                color = COLOR_LOCKED_BOX
+                thickness = 3
+                if target.is_visible(person):
+                    label = f"LOCK {target.name.upper()} {person.bbox_confidence:.2f}"
+                else:
+                    label = f"LOCK BACK {person.bbox_confidence:.2f}"
+            else:
+                if target.is_visible(person):
+                    color = COLOR_FACE_BOX
+                    thickness = 2
+                    label = f"{target.name.upper()} {person.bbox_confidence:.2f}"
+                else:
+                    color = COLOR_BODY_BOX
+                    thickness = 2
+                    label = f"BACK {person.bbox_confidence:.2f}"
+
             tracked_person = person
+            if target.is_visible(person):
+                target_x, target_y = target.point(person)
+                tracking = True
         else:
-            color = COLOR_BODY_BOX
-            label = f"BACK {person.bbox_confidence:.2f}"
-            if tracked_person is None:
-                tracked_person = person   # bbox-only fallback for pitch distance
+            color = COLOR_DECOY_BOX
+            thickness = 1
+            label = f"P{idx} {person.bbox_confidence:.2f}"
 
-        cv2.rectangle(frame, (person.x1, person.y1), (person.x2, person.y2), color, 2)
-        cv2.putText(frame, label, (person.x1, person.y1 - 8),
-                    HUD_FONT, 0.55, color, 1)
+        cv2.rectangle(frame, (person.x1, person.y1), (person.x2, person.y2), color, thickness)
 
-        if tracking and person is tracked_person and target_x is not None:
-            cv2.circle(frame, (target_x, target_y), 6, COLOR_FACE_BOX, -1)
+        # Locked label sits inside a filled badge for visibility against any background.
+        if is_chosen and locked:
+            (tw, th), _ = cv2.getTextSize(label, HUD_FONT, 0.55, 1)
+            cv2.rectangle(frame, (person.x1, person.y1 - th - 10),
+                          (person.x1 + tw + 8, person.y1), color, -1)
+            cv2.putText(frame, label, (person.x1 + 4, person.y1 - 5),
+                        HUD_FONT, 0.55, COLOR_LOCK_LABEL, 1)
+        else:
+            cv2.putText(frame, label, (person.x1, person.y1 - 8),
+                        HUD_FONT, 0.55, color, 1)
+
+        if is_chosen and target_x is not None:
+            cv2.circle(frame, (target_x, target_y), 6, color, -1)
 
     return target_x, target_y, tracking, tracked_person
 

@@ -11,8 +11,8 @@ No drone SDK calls, no drawing — pure data + pure functions on Person.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable, Optional
+from dataclasses import dataclass, field
+from typing import Callable, Optional, TYPE_CHECKING
 
 from interceptor.perception import Person, KEYPOINT_VISIBILITY_THRESHOLD
 from interceptor.constants import (
@@ -20,10 +20,18 @@ from interceptor.constants import (
     BBOX_WIDTH_RATIO_SETPOINT,
     FRAME_HEIGHT_PIXELS,
     FRAME_WIDTH_PIXELS,
+    LOCK_EMBEDDING_EMA_ALPHA,
+    LOCK_MATCH_THRESHOLD,
     NOSE_CONFIDENCE_THRESHOLD,
     SHOULDER_WIDTH_RATIO_SETPOINT,
     YOLO_CONFIDENCE_MIN,
 )
+
+# Torch is only needed for the LockState embedding and the locked-selector
+# cosine-distance computation. Tests for the visibility predicates and the
+# unlocked selector path do not exercise these.
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass(frozen=True)
@@ -220,6 +228,128 @@ def select_best_person(
         return min(visible, key=_dist_sq)
 
     return max(pool, key=lambda p: p.bbox_area_pixels)
+
+
+# ---------------------------------------------------------------------------
+# Multi-target lock — ReID-based identity persistence
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LockState:
+    """Holds the locked person's ReID fingerprint plus last-known location.
+
+    Attributes:
+        embedding: 1-D L2-normalized (512,) tensor on the embedder's device.
+            None = unlocked (drone uses default biggest-bbox selection).
+        last_point_px: last known (x, y) of the locked person's tracking
+            target point. Used as a spatial prior when ambiguous matches occur
+            and to drive the search-FSM grace-period yaw recovery.
+    """
+
+    embedding: Optional["torch.Tensor"] = None
+    last_point_px: Optional[tuple[float, float]] = None
+
+    @property
+    def is_locked(self) -> bool:
+        return self.embedding is not None
+
+    def clear(self) -> None:
+        """Reset to unlocked. Selector falls back to biggest-bbox behavior."""
+        self.embedding = None
+        self.last_point_px = None
+
+    def lock_from(self, embedding: "torch.Tensor",
+                  point_px: Optional[tuple[float, float]] = None) -> None:
+        """Initialize the lock from a fresh detection's embedding.
+
+        `embedding` must already be L2-normalized — the caller (ReidEmbedder)
+        guarantees this. We detach + clone so subsequent batch updates don't
+        mutate the stored vector.
+        """
+        self.embedding = embedding.detach().clone()
+        self.last_point_px = point_px
+
+    def update(self, new_embedding: "torch.Tensor",
+               new_point_px: Optional[tuple[float, float]] = None,
+               alpha: float = LOCK_EMBEDDING_EMA_ALPHA) -> None:
+        """EMA-blend the locked embedding toward a freshly matched detection.
+
+        Tracks slow appearance drift (turning around, lighting shift) without
+        erasing identity. Re-normalizes so cosine distance stays well-defined.
+        Caller MUST only invoke this when a match was confirmed; updating on
+        a mismatched detection corrupts the fingerprint and loses the lock.
+        """
+        if self.embedding is None:
+            return
+        # Local import keeps the module importable when torch isn't available
+        # (tests that exercise only the unlocked path).
+        from interceptor.reid import update_embedding_ema
+        self.embedding = update_embedding_ema(self.embedding, new_embedding, alpha)
+        if new_point_px is not None:
+            self.last_point_px = new_point_px
+
+
+def select_target_person(
+    persons: list[Person],
+    target: "Target",
+    lock: LockState,
+    embeddings: Optional["torch.Tensor"] = None,
+    last_smoothed_point_px: Optional[tuple[float, float]] = None,
+    match_threshold: float = LOCK_MATCH_THRESHOLD,
+) -> tuple[Optional[Person], Optional[int], float]:
+    """Pick the active tracking target out of `persons`.
+
+    Two regimes:
+        1. lock.is_locked = False — fall through to select_best_person:
+           nearest-to-last-point if visible, else largest bbox.
+        2. lock.is_locked = True — compute cosine distance from lock.embedding
+           to each detection's embedding; pick min distance if below
+           match_threshold, else return None (drone enters grace+search FSM
+           pipeline keyed on the LOCKED target only).
+
+    Args:
+        persons: detections this frame.
+        target: active Target (defines visibility predicate + point extractor).
+        lock: current lock state. Mutated only by the orchestrator, never
+            here — this function is pure inspection.
+        embeddings: (N, 512) L2-normalized embeddings matching `persons` order,
+            or None when lock is unlocked (skips the costly embed step).
+        last_smoothed_point_px: tracker's last EMA-smoothed target point,
+            used as the nearest-neighbour prior in the unlocked regime.
+        match_threshold: cosine-distance cutoff for the locked regime.
+
+    Returns:
+        (chosen_person, chosen_index, match_distance):
+            chosen_person — Person to track, or None.
+            chosen_index — index of chosen person in `persons`, or None.
+            match_distance — cosine distance of the chosen match in the
+                locked regime; -1.0 when unlocked (no embedding compared).
+    """
+    if not persons:
+        return None, None, -1.0
+
+    if not lock.is_locked:
+        best = select_best_person(persons, target, last_smoothed_point_px)
+        if best is None:
+            return None, None, -1.0
+        return best, persons.index(best), -1.0
+
+    # Locked regime — must have embeddings to match against.
+    if embeddings is None or embeddings.shape[0] != len(persons):
+        return None, None, -1.0
+
+    import torch  # local import — only paid in the locked path
+    locked_vec = lock.embedding.flatten()
+    # Vectorized cosine: embeddings (N, 512) @ locked_vec (512,) = (N,)
+    sims = embeddings @ locked_vec
+    dists = 1.0 - sims  # (N,) cosine distances in [0, 2]
+    best_idx_t = torch.argmin(dists)
+    best_idx = int(best_idx_t.item())
+    best_dist = float(dists[best_idx_t].item())
+
+    if best_dist > match_threshold:
+        return None, None, best_dist
+    return persons[best_idx], best_idx, best_dist
 
 
 # ---------------------------------------------------------------------------
