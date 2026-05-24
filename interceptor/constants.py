@@ -43,11 +43,6 @@ MIN_TRACKING_ALTITUDE_CM = 30   # floor clamp
 
 TARGET_LOST_GRACE_S = 4.0 # to avoid altitude PID flickering; longer = more time yawing toward last-seen side before full search FSM
 
-# Drop _locked_track_id after this many consecutive seconds of no detection
-# matching the locked id. BoT-SORT reassigns ids after re-id failures; without
-# auto-clear the lock becomes permanent dead-lock and drone never re-tracks.
-LOCK_LOST_TIMEOUT_S = 3.0
-
 INTERCEPT_DISTANCE_CM       = 95
 FRONT_TOF_MAX_RANGE_CM      = 120
 FRONT_TOF_WALL_STOP_CM      = 60

@@ -21,7 +21,7 @@ from .constants import (
     SEARCH_OPEN_SPACE_VELOCITY_CM_S,
     GRACE_RECOVERY_YAW_DEG_S, GRACE_RECOVERY_MIN_OFFSET_PX,
     TARGET_EMA_ALPHA, FB_MAX_VELOCITY_CM_S, FRAME_CENTER_X, FRAME_CENTER_Y,
-    TARGET_LOST_GRACE_S, LOCK_LOST_TIMEOUT_S, FRONT_TOF_WALL_STOP_CM, FRONT_TOF_DISCONTINUITY_FREEZE_S,
+    TARGET_LOST_GRACE_S, FRONT_TOF_WALL_STOP_CM, FRONT_TOF_DISCONTINUITY_FREEZE_S,
     FRONT_TOF_INVALID_HYSTERESIS_FRAMES, TRACKING_MISS_HYSTERESIS_FRAMES,
     SEARCH_ADVANCE_MAX_DISTANCE_CM,
     SEARCH_ADVANCE_SWEEP_EVERY_S, SEARCH_ADVANCE_SWEEP_YAW_DEG_S,
@@ -43,7 +43,6 @@ from .hud_overlay import (
     draw_target_y_line,
     draw_frame_crosshair,
     draw_person_overlays,
-    draw_all_track_labels,
     draw_phantom_badge,
     draw_telemetry_strip,
     draw_wall_warning,
@@ -158,15 +157,6 @@ class TelloInterceptor:
         self._target_smoothed_x_px: float = 0.0
         self._target_smoothed_y_px: float = 0.0
         self._target_ema_initialized: bool = False
-
-        # Single-person identity lock via BoT-SORT track id. Set during pre-takeoff
-        # enrollment (press 'i' on the OpenCV window). When set, select_best_person
-        # only returns detections with this id — drone refuses to swap onto strangers.
-        # Lock survives across hover/search modes. Manually re-set via 'i' if track lost.
-        self._locked_track_id: Optional[int] = None
-        # Timestamp of last frame where locked id was found. Used to auto-clear the
-        # lock after LOCK_LOST_TIMEOUT_S so re-id failures don't dead-lock the drone.
-        self._locked_last_seen_time: float = 0.0
 
         # EMA-smoothed closeness signal for bbox pitch PID. Same TARGET_EMA_ALPHA as
         # target x/y — closeness is computed from raw detection, jitters per frame.
@@ -353,7 +343,7 @@ class TelloInterceptor:
             "rc_fb":           self.rc[1],
             "rc_ud":           self.rc[2],
             "rc_yaw":          self.rc[3],
-            "locked_track_id": self._locked_track_id,
+            "locked_track_id": None,
             "search_state":    self._search_state,
             "target_name":     getattr(TARGET, "name", "—"),
             "available_targets": list(AVAILABLE_TARGETS.keys()),
@@ -620,55 +610,21 @@ class TelloInterceptor:
             # someone), select nearest-to-last detection. EMA gets cleared in hover/search
             # branches → next acquire falls back to largest-bbox. This pins identity for
             # the duration of a continuous track and re-locks cleanly after a true loss.
-            #
-            # locked_track_id (set via enrollment, key 'i') is the strongest constraint —
-            # overrides nearest/largest and only matches the enrolled BoT-SORT id.
             last_point_px = (
                 (self._target_smoothed_x_px, self._target_smoothed_y_px)
                 if self._target_ema_initialized else None
             )
-            best_person = select_best_person(
-                detected_persons, TARGET, last_point_px, self._locked_track_id
-            )
-
-            # Auto-clear lock if locked track_id missing > LOCK_LOST_TIMEOUT_S.
-            # BoT-SORT reassigns ids on re-id failures, so stale lock would block
-            # all detections forever. Reset timer whenever locked id matched.
-            if self._locked_track_id is not None:
-                locked_present = any(p.track_id == self._locked_track_id for p in detected_persons)
-                if locked_present:
-                    self._locked_last_seen_time = time.time()
-                elif self._locked_last_seen_time > 0 and (time.time() - self._locked_last_seen_time) > LOCK_LOST_TIMEOUT_S:
-                    print(f"[ENROLL] Lock #{self._locked_track_id} stale > {LOCK_LOST_TIMEOUT_S}s — auto-clearing.")
-                    self._locked_track_id = None
-                    self._locked_last_seen_time = 0.0
-                    # Re-run selection without the dead lock so this frame still tracks.
-                    best_person = select_best_person(
-                        detected_persons, TARGET, last_point_px, None
-                    )
+            best_person = select_best_person(detected_persons, TARGET, last_point_px)
 
             persons_to_draw = [best_person] if best_person is not None else []
 
             # Build web frame BEFORE HUD overlays land on current_frame.
-            # Reuses draw_person_overlays so bbox color + target-name label match
-            # the cv2 window exactly. Adds LOCK badge for the locked id. Skips
-            # telemetry strip, crosshair, mode badge — dashboard already shows that.
             web_frame = current_frame.copy()
             draw_person_overlays(web_frame, persons_to_draw, TARGET)
-            if self._locked_track_id is not None:
-                for p in persons_to_draw:
-                    if p.track_id == self._locked_track_id:
-                        cv2.putText(web_frame, f"LOCK #{p.track_id}",
-                                    (p.x1, p.y2 + 22),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
             """
             HUD overlays
             """
-            # Draw track id + rank on every detected person first so labels sit
-            # under the highlighted target box drawn next.
-            draw_all_track_labels(current_frame, detected_persons, self._locked_track_id)
-
             target_x_px, target_y_px, tracking_target, tracked_person = draw_person_overlays(
                 current_frame, persons_to_draw, TARGET
             )
@@ -1225,29 +1181,9 @@ class TelloInterceptor:
                 self.pitch_bbox_pid.reset_integral()
                 self.roll_pid.reset_integral()
 
-            # I — enroll / cycle. Sort detections by bbox area desc. If no lock or
-            # locked id missing this frame, lock rank 1 (largest). Else advance to
-            # the next rank, wrapping to 1 after the last. Visual rank shown on HUD.
-            if self._i_rising_edge:
-                with_id = [p for p in detected_persons if p.track_id is not None]
-                if not with_id:
-                    print("[ENROLL] No detections with track_id — nothing to lock.")
-                else:
-                    sorted_persons = sorted(with_id, key=lambda p: p.bbox_area_pixels, reverse=True)
-                    ids_sorted = [p.track_id for p in sorted_persons]
-                    if self._locked_track_id not in ids_sorted:
-                        new_id = ids_sorted[0]
-                    else:
-                        current_index = ids_sorted.index(self._locked_track_id)
-                        new_id = ids_sorted[(current_index + 1) % len(ids_sorted)]
-                    self._locked_track_id = new_id
-                    self._locked_last_seen_time = time.time()
-                    print(f"[ENROLL] Locked track_id={new_id} (rank {ids_sorted.index(new_id) + 1}/{len(ids_sorted)})")
-
-            # C — clear lock. Drone falls back to nearest/largest selection.
-            if self._c_rising_edge:
-                self._locked_track_id = None
-                print("[ENROLL] Lock cleared.")
+            # I / C — lock feature disabled (BoT-SORT + ReID removed).
+            if self._i_rising_edge or self._c_rising_edge:
+                print("[WARN] Lock feature disabled.")
 
         cv2.destroyAllWindows()
 

@@ -34,39 +34,6 @@ COLOR_TELEMETRY_PRIMARY = (0, 200, 255)
 COLOR_TELEMETRY_SECONDARY = (150, 150, 255)
 COLOR_MANUAL_BADGE = (0, 220, 255)    # yellow-ish
 COLOR_AUTO_BADGE = (180, 180, 180)    # grey
-COLOR_TRACK_ID = (255, 200, 0)        # cyan-ish for unlocked track id
-COLOR_LOCKED_BOX = (0, 0, 255)        # red for locked target
-
-def draw_all_track_labels(
-    frame: np.ndarray,
-    persons: "list[Person]",
-    locked_track_id: Optional[int] = None,
-) -> None:
-    """Draw thin bbox + track_id label on every detection.
-
-    Locked target gets a thick red box. Others get thin cyan boxes with
-    "ID:N rank:R" — R is bbox-area rank (1=largest). Lets user see all
-    candidate IDs at a glance and choose which to lock via the cycle key.
-    """
-    if not persons:
-        return
-    sorted_by_area = sorted(persons, key=lambda p: p.bbox_area_pixels, reverse=True)
-    rank_by_person = {id(p): i + 1 for i, p in enumerate(sorted_by_area)}
-    for person in persons:
-        is_locked = (
-            locked_track_id is not None
-            and person.track_id == locked_track_id
-        )
-        color = COLOR_LOCKED_BOX if is_locked else COLOR_TRACK_ID
-        thickness = 3 if is_locked else 1
-        cv2.rectangle(frame, (person.x1, person.y1), (person.x2, person.y2), color, thickness)
-        id_text = f"ID:{person.track_id}" if person.track_id is not None else "ID:?"
-        rank = rank_by_person[id(person)]
-        label = f"{id_text} rank:{rank}"
-        if is_locked:
-            label = f"[LOCKED] {label}"
-        cv2.putText(frame, label, (person.x1, person.y2 + 18),
-                    HUD_FONT, 0.55, color, 1)
 
 
 def draw_person_overlays(
