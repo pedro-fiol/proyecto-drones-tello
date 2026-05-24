@@ -6,7 +6,7 @@ Three IO surfaces:
   GET  /video         multipart MJPEG stream of last annotated frame
   WS   /ws/telemetry  20 Hz JSON push of all sensor + control state
   POST /cmd/*         operator commands (takeoff_land, toggle_manual,
-                      enroll, clear_lock, stop)
+                      lock, clear_lock, stop)
 
 Designed to run on localhost only — PC is on the Tello WiFi AP (no internet),
 so no STUN/TURN, no HTTPS, no auth. If you ever expose this to a WAN, add a
@@ -112,9 +112,9 @@ def build_app(interceptor) -> FastAPI:
         interceptor.web_request_toggle_manual()
         return {"ok": True}
 
-    @app.post("/cmd/enroll")
-    def cmd_enroll():
-        interceptor.web_request_enroll()
+    @app.post("/cmd/lock")
+    def cmd_lock():
+        interceptor.web_request_lock()
         return {"ok": True}
 
     @app.post("/cmd/clear_lock")

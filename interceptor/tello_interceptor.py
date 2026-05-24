@@ -285,7 +285,7 @@ class TelloInterceptor:
         self.current_mode_label: str = "init"
         self._web_takeoff_land_pending: bool = False
         self._web_toggle_manual_pending: bool = False
-        self._web_enroll_pending: bool = False
+        self._web_lock_pending: bool = False
         self._web_clear_lock_pending: bool = False
 
         # Web manual control: heartbeat timestamp. web_set_manual_velocity()
@@ -305,9 +305,9 @@ class TelloInterceptor:
         """Toggle manual keyboard mode — same effect as pressing M."""
         self._web_toggle_manual_pending = True
 
-    def web_request_enroll(self) -> None:
+    def web_request_lock(self) -> None:
         """Lock / cycle target — same effect as pressing I."""
-        self._web_enroll_pending = True
+        self._web_lock_pending = True
 
     def web_request_clear_lock(self) -> None:
         """Clear identity lock — same effect as pressing C."""
@@ -1372,9 +1372,9 @@ class TelloInterceptor:
         if self._web_toggle_manual_pending:
             self._m_rising_edge = True
             self._web_toggle_manual_pending = False
-        if self._web_enroll_pending:
+        if self._web_lock_pending:
             self._i_rising_edge = True
-            self._web_enroll_pending = False
+            self._web_lock_pending = False
         if self._web_clear_lock_pending:
             self._c_rising_edge = True
             self._web_clear_lock_pending = False
