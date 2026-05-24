@@ -1183,10 +1183,15 @@ class TelloInterceptor:
                                     self.tello.get_own_udp_object()['responses'].clear()
                                 
                                 if self._is_airborne:
-                                    self.tello.land()
+                                    # Optimistic: assume land() works at hardware level even if
+                                    # SDK pops the wrong response and raises. Flip flag first.
                                     self._is_airborne = False
+                                    self.tello.land()
                                 else:
-                                    self.tello.takeoff()
+                                    # Optimistic: drone hardware accepts takeoff before djitellopy
+                                    # confirms via UDP. Stale "keepalive" / "tof N" in response
+                                    # queue can make takeoff() raise even though drone lifted.
+                                    # Flip flag first so RC loop + FSM aren't dead-locked grounded.
                                     self._is_airborne = True
                                     # Zero manual sticks + wipe PID integrals so whichever
                                     # mode is active post-takeoff (auto or manual) starts
@@ -1199,11 +1204,12 @@ class TelloInterceptor:
                                     self.pitch_pid.reset_integral()
                                     self.pitch_bbox_pid.reset_integral()
                                     self.roll_pid.reset_integral()
+                                    self.tello.takeoff()
                         except TelloException as e:
-                            # Do NOT touch _is_airborne here. The successful-path assignment
-                            # only runs if the SDK call returned. If it raised, the flag is
-                            # already correct (still pre-call value).
-                            print(f"[WARN] takeoff/land failed: {e}")
+                            # Flag already flipped pre-call. Hardware likely executed the command
+                            # even though SDK raised (response queue race). Leave flag as-is —
+                            # reflects real drone state better than reverting on SDK noise.
+                            print(f"[WARN] takeoff/land SDK raised (flag kept): {e}")
                         finally:
                             self._is_toggling_flight = False
                     threading.Thread(target=_toggle_flight, daemon=True).start()
