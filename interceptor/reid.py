@@ -10,7 +10,7 @@ across frames and out-of-frame re-acquisition.
 Public surface:
     ReidEmbedder(device).embed_batch(crops_bgr) -> Tensor (N, 512)
     cosine_distance(a, b) -> float in [0, 2]
-    download_weights_if_missing(path, gdrive_id) -> bool
+    resolve_weights_path(path) -> str
 
 No drone SDK calls, no drawing, no FSM logic. Pure perception adjunct.
 """
@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 
 # Deep import is fine — torchreid's eager root __init__ has heavy deps, but we
-# already paid that cost during package install (tensorboard, gdown).
+# already paid that cost during package install (tensorboard).
 import torchreid
 from torchreid.reid.utils.torchtools import load_pretrained_weights
 
@@ -36,7 +36,6 @@ from interceptor.constants import (
     REID_MODEL_NAME,
     REID_PIXEL_MEAN,
     REID_PIXEL_STD,
-    REID_WEIGHTS_GDRIVE_ID,
     REID_WEIGHTS_PATH,
 )
 
@@ -45,35 +44,19 @@ from interceptor.constants import (
 # Weights helper
 # ---------------------------------------------------------------------------
 
-def download_weights_if_missing(path: str = REID_WEIGHTS_PATH,
-                                gdrive_id: str = REID_WEIGHTS_GDRIVE_ID) -> str:
-    """Ensure local weight file exists; download from Google Drive if not.
+def resolve_weights_path(path: str = REID_WEIGHTS_PATH) -> str:
+    """Return absolute weight-file path. Raises FileNotFoundError if missing.
 
-    Returns the absolute path to the weight file. Raises RuntimeError if the
-    download fails — the operator must then place the file manually.
+    Weights are vendored in models/ (see .gitignore exception). If the file
+    is absent the operator deleted/moved it — fix locally rather than auto-
+    fetching from a flaky Drive link.
     """
     abs_path = os.path.abspath(path)
-    if os.path.isfile(abs_path):
-        return abs_path
-
-    os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
-    print(f"[INFO] ReID weights missing - downloading from Google Drive ({gdrive_id}) -> {abs_path}")
-    try:
-        import gdown
-    except ImportError as e:
-        raise RuntimeError(
-            "gdown not installed; cannot auto-download ReID weights. "
-            f"Install it (`pip install gdown`) or place the file manually at {abs_path}."
-        ) from e
-
-    url = f"https://drive.google.com/uc?id={gdrive_id}"
-    out = gdown.download(url, abs_path, quiet=False)
-    if out is None or not os.path.isfile(abs_path):
-        raise RuntimeError(
-            f"Failed to download ReID weights from {url}. "
-            f"Download manually and place at {abs_path}."
+    if not os.path.isfile(abs_path):
+        raise FileNotFoundError(
+            f"ReID weights missing at {abs_path}. "
+            f"Restore from git (file is vendored at models/osnet_x0_25_msmt17.pt)."
         )
-    print(f"[INFO] ReID weights downloaded ({os.path.getsize(abs_path)} bytes)")
     return abs_path
 
 
@@ -93,7 +76,7 @@ class ReidEmbedder:
 
     def __init__(self, device: Optional[str] = None) -> None:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        weight_path = download_weights_if_missing()
+        weight_path = resolve_weights_path()
 
         model = torchreid.models.build_model(
             name=REID_MODEL_NAME,

@@ -68,7 +68,6 @@ TRACKING_MISS_HYSTERESIS_FRAMES = 45
 SEARCH_SPIN_VELOCITY_DEG_S    = 50
 SEARCH_YAW_TOLERANCE_DEG      = 5
 SEARCH_SAMPLE_EVERY_DEG       = 10       # min yaw delta between direction samples during spin
-SEARCH_MAX_CYCLES             = 3        # spin+advance cycles before hover_done
 SEARCH_ADVANCE_TOLERANCE_CM   = 15       # advance done when |INTERCEPT_DISTANCE_CM - front_tof_cm| < this
 SEARCH_ADVANCE_TIMEOUT_S      = 8.0      # bail if PID never settles (open space, ToF dropouts)
 SEARCH_OPEN_SPACE_VELOCITY_CM_S = 30     # fb when ToF out-of-range during advance (no obstacle yet → push forward until ToF acquires)
@@ -108,14 +107,6 @@ GAINS_FORWARD_BACK_BBOX_PID = (0, 0.0, 0.0)   # ratio err → fb
 GAINS_LEFT_RIGHT_PID        = (0.2, 0.01, 0.15)   # px error  → lr
 """
 
-# ---- Failure tiers ----
-BATTERY_MEDIUM_PERCENT      = 5
-BATTERY_HARD_PERCENT        = 3
-CONNECTION_DROP_MEDIUM_S    = 5
-CONNECTION_DROP_HARD_S      = 5
-TOF_STUCK_MEDIUM_S          = 5
-ERROR_HOVER_TIMEOUT_S       = 5
-
 # ---- RC loop ----
 RC_LOOP_INTERVAL_S          = 0.05   # 20 Hz
 
@@ -129,12 +120,11 @@ WEB_MANUAL_HEARTBEAT_GRACE_S = 0.6
 
 
 # ---- ReID (Phase 8: multi-target lock) ----
-# Backbone + weights. OSNet x0_25 trained on MSMT17 — small (~3MB), fast (~3ms/crop GPU),
+# Backbone + weights. OSNet x0_25 trained on MSMT17 — small (~9MB), fast (~3ms/crop GPU),
 # and trained on the most varied person-ReID dataset available so it generalizes to
-# indoor drone footage. Weights file is downloaded on first run via gdown.
+# indoor drone footage. Weights file vendored in models/ (see .gitignore exception).
 REID_MODEL_NAME            = "osnet_x0_25"
 REID_WEIGHTS_PATH          = "models/osnet_x0_25_msmt17.pt"
-REID_WEIGHTS_GDRIVE_ID     = "1Kkx2zW89jq_NETu4u42CFZTMVD5Hwm6e"  # osnet_x0_25_msmt17 (torchreid model zoo)
 REID_INPUT_SIZE_HW         = (256, 128)             # ReID standard input
 REID_PIXEL_MEAN            = (0.485, 0.456, 0.406)  # ImageNet normalization
 REID_PIXEL_STD             = (0.229, 0.224, 0.225)

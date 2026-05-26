@@ -427,6 +427,8 @@ env/
 *.pt
 *.onnx
 *.weights
+# Exception: ReID backbone (small, vendored to skip gdrive auto-download).
+!models/osnet_x0_25_msmt17.pt
 
 # Python cache
 __pycache__/

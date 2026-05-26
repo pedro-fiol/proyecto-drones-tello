@@ -139,10 +139,10 @@ class TelloInterceptor:
         self.person_detector = PersonDetector(device=DEVICE)
 
         # ---- Multi-target lock (Phase 8) ----
-        # ReidEmbedder loads OSNet x0_25 + MSMT17 weights on first run (auto-
-        # download via gdown). If load fails (no GPU / weights download error)
-        # the lock feature degrades to unavailable but the drone still flies
-        # normally (unlocked = biggest-bbox tracking, identical to prior behavior).
+        # ReidEmbedder loads OSNet x0_25 + MSMT17 weights from models/ (vendored
+        # in repo). If load fails (missing file / no GPU) the lock feature
+        # degrades to unavailable but the drone still flies normally (unlocked =
+        # biggest-bbox tracking, identical to prior behavior).
         try:
             self.reid: Optional[ReidEmbedder] = ReidEmbedder(device=DEVICE)
         except Exception as exc:
@@ -411,7 +411,21 @@ class TelloInterceptor:
     def start(self):
 
         print("[INFO] Connecting to Tello...")
-        self.tello.connect()
+        last_exc = None
+        for attempt in range(1, 4):
+            try:
+                self.tello.connect()
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                print(f"[WARN] connect attempt {attempt}/3 failed: {exc}")
+                time.sleep(2.0)
+        if last_exc is not None:
+            raise RuntimeError(
+                "Tello connect failed after 3 attempts. "
+                "Check WiFi is on the Tello AP (run switch-tello.ps1 tello)."
+            ) from last_exc
         print(f"[INFO] Connected. Battery: {self.tello.get_battery()}%")
 
         # Reset drone from previous run just in case
@@ -936,7 +950,6 @@ class TelloInterceptor:
                 else:
                     self._tof_invalid_count += 1
 
-                # revisar desde aquí
                 if self._last_valid_front_tof_cm > 0 and self._tof_invalid_count < FRONT_TOF_INVALID_HYSTERESIS_FRAMES:
                     pitch_source = "tof"
                     front_tof_for_pid = self.front_tof_cm if valid_front_tof else self._last_valid_front_tof_cm
@@ -1131,39 +1144,6 @@ class TelloInterceptor:
                         # Watch ToF during sweep — any close reading = off-axis wall
                         if valid_front_tof and self.front_tof_cm <= SEARCH_ADVANCE_SWEEP_WALL_CM:
                             self._advance_sweep_obstacle = True
-
-
-            
-
-    
-                    
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
             # Manual keyboard override — replaces PID output before safety clamp.
             # Safety blocks below still apply on top, keyboard cannot bypass them.
