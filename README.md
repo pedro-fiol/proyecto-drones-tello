@@ -164,7 +164,7 @@ Cada frame del stream:
 
 ## Multi-target lock (ReID)
 
-Cuando hay **varias personas** en el frame, el dron debe perseguir a una concreta y no saltar de una a otra. Solución: pytorchreid
+Cuando hay **varias personas** en el frame, el dron debe seguir a una concreta y no saltar de una a otra. Solución: pytorchreid
 
 - Modelo: **OSNet x0_25** entrenado en **MSMT17** (`models/osnet_x0_25_msmt17.pt`).
 - Cada detección se convierte en un vector 512-D unitario.
