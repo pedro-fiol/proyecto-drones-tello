@@ -23,6 +23,8 @@ torchvision==0.20.1+cu121
 # --- Perception models ---
 ultralytics==8.4.41                 # YOLOv8s-pose
 torchreid==0.2.5                    # OSNet ReID embedder
+gdown==6.0.0                        # transitive: torchreid imports it eagerly
+tensorboard==2.20.0                 # transitive: torchreid imports it eagerly
 
 # --- Web dashboard (FastAPI + WebSocket + MJPEG) ---
 fastapi==0.136.1

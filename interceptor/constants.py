@@ -52,9 +52,8 @@ FRONT_TOF_DISCONTINUITY_FREEZE_S = 0.5
 # switching to bbox fallback. Stops ToF↔bbox flicker at edge of ToF range.
 FRONT_TOF_INVALID_HYSTERESIS_FRAMES = 3
 
-# Detection hysteresis: keep treating target as visible for N consecutive miss frames.
-# YOLO confidence dips below threshold for a single frame trigger grace/EMA reset →
-# yaw PID restarts on every dropout → constant oscillation. Hold last smoothed state instead.
+# Detection hysteresis keep treating target as visible: for N consecutive miss frames.
+# tp avoid YAW oscillation because drone switched modes
 TRACKING_MISS_HYSTERESIS_FRAMES = 45
 
 
@@ -86,21 +85,13 @@ GRACE_RECOVERY_MIN_OFFSET_PX  = 100      # only trigger if target was that far o
 
 # ---- PID gains (kp, ki, kd) ----
 
-GAINS_ALTITUDE_PID          = (1.4, 0.04, 0.08)         # cm error  → ud  (baro mode)
+GAINS_ALTITUDE_PID          = (1.4, 0.04, 0.08)         # cm error  → ud  
 GAINS_ALTITUDE_TARGET_PID   = (-0.15, -0.004, -0.08)    # px error  → ud  (image-y inverted vs world-up)
 GAINS_YAW_PID               = (0.2, 0.003, 0.1)       # px error  → yaw
 GAINS_FORWARD_BACK_TOF_PID = (-0.85, -0.02, -0.42)   # cm error → fb
 GAINS_FORWARD_BACK_BBOX_PID = (200, 0.0, 20.0)   # ratio err → fb
 GAINS_LEFT_RIGHT_PID        = (0.2, 0.01, 0.15)   # px error  → lr
 
-"""
-GAINS_ALTITUDE_PID          = (0, 0.04, 0.08)         # cm error  → ud  (baro mode)
-GAINS_ALTITUDE_TARGET_PID   = (-0.15, -0.004, -0.08)    # px error  → ud  (image-y inverted vs world-up)
-GAINS_YAW_PID               = (0, 0, 0)       # px error  → yaw
-GAINS_FORWARD_BACK_TOF_PID = (0, 0, 0)   # cm error → fb
-GAINS_FORWARD_BACK_BBOX_PID = (0, 0.0, 0.0)   # ratio err → fb
-GAINS_LEFT_RIGHT_PID        = (0.2, 0.01, 0.15)   # px error  → lr
-"""
 
 # ---- RC loop ----
 RC_LOOP_INTERVAL_S          = 0.05   # 20 Hz
@@ -117,7 +108,7 @@ WEB_MANUAL_HEARTBEAT_GRACE_S = 0.6
 # ---- ReID (Phase 8: multi-target lock) ----
 # Backbone + weights. OSNet x0_25 trained on MSMT17 — small (~9MB), fast (~3ms/crop GPU),
 # and trained on the most varied person-ReID dataset available so it generalizes to
-# indoor drone footage. Weights file vendored in models/ (see .gitignore exception).
+# indoor drone footage. Weights file vendored in models/ 
 REID_MODEL_NAME            = "osnet_x0_25"
 REID_WEIGHTS_PATH          = "models/osnet_x0_25_msmt17.pt"
 REID_INPUT_SIZE_HW         = (256, 128)             # ReID standard input
@@ -126,30 +117,27 @@ REID_PIXEL_STD             = (0.229, 0.224, 0.225)
 
 # Lock match: cosine distance threshold. Below = same person, above = different.
 # 0.30 is a sane default for OSNet on MSMT17 — typical same-person dist 0.05-0.20,
-# typical cross-person dist 0.35-0.70. Tune via lock_response.csv log if needed.
+# typical cross-person dist 0.35-0.70. 
 LOCK_MATCH_THRESHOLD       = 0.30
 
 # Lock-time EMA on locked embedding. Each frame the locked target is matched,
 # embedding moves alpha toward the new sample. Absorbs slow pose/lighting drift
-# without losing identity. alpha=0.05 → ~20-frame time constant.
+# without losing identity.
 LOCK_EMBEDDING_EMA_ALPHA   = 0.05
 
 
-# ---- Target tracking (Phase 6a) ----
+# ---- Target tracking ----
 # Closeness setpoints used by the pitch fallback PID when front ToF is invalid.
 # Each Target picks one of these via target.closeness_setpoint. Higher closeness =
 # closer person. Drone advances under the bbox PID until closeness reaches setpoint.
 #
-# BBOX_HEIGHT_RATIO_SETPOINT — for nose/eyes/bbox targets that frame the full body.
-#   0.75 ≈ bbox fills 75% of frame height ≈ ~50cm distance. Pushes the drone INTO
-#   the ToF acquisition range when ToF is blind (cone misalignment).
+# BBOX_HEIGHT_RATIO_SETPOINT: for nose/eyes/bbox targets that frame the full body.
+#   0.75 ≈ bbox fills 75% of frame height. Pushes the drone INTO the ToF acquisition range.
 #
-# BBOX_WIDTH_RATIO_SETPOINT — for SHOULDERS_MIDPOINT_TARGET. Person bbox width normalized
-#   by frame width. More reliable than shoulder keypoint spread (works even if one
-#   shoulder keypoint is low-confidence). Starts at 0.35 — tune by walking to known
-#   distance (e.g. 80cm from drone) and reading closeness from HUD/log.
+# BBOX_WIDTH_RATIO_SETPOINT: for SHOULDERS_MIDPOINT_TARGET. Person bbox width normalized
+#   by frame width. 
 #
-# SHOULDER_WIDTH_RATIO_SETPOINT — kept for reference / fallback.
+# SHOULDER_WIDTH_RATIO_SETPOINT: kept for reference / fallback.
 #
 # The active TARGET selection lives in interceptor/target.py to avoid circular imports.
 BBOX_HEIGHT_RATIO_SETPOINT     = 0.7

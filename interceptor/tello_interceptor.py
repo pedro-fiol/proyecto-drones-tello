@@ -60,9 +60,8 @@ logging.getLogger("djitellopy").setLevel(logging.WARNING)
 
 
 
-# ---- Windows keyboard input (manual mode) ----
-# GetAsyncKeyState polled each frame for hold-to-move (release = stop).
-# PeekMessage drain stops cv2 freeze when key held (OS WM_KEYDOWN flood).
+# Windows keyboard input — GetAsyncKeyState for hold-to-move,
+# PeekMessage drain to stop cv2 freeze when key held.
 _user32 = ctypes.windll.user32
 _VK_W, _VK_S, _VK_A, _VK_D, _VK_Q, _VK_E = 0x57, 0x53, 0x41, 0x44, 0x51, 0x45
 _VK_UP, _VK_DOWN = 0x26, 0x28
@@ -91,30 +90,24 @@ _WM_KEYFIRST, _WM_KEYLAST = 0x0100, 0x0109
 
 
 def _drain_keyboard_messages() -> None:
-    """Flush WM_KEY* from this thread's queue so cv2 render pump keeps up under held keys."""
+    """Drain WM_KEY* from queue — cv2 freezes otherwise when key held."""
     msg = _MSG()
     while _user32.PeekMessageW(ctypes.byref(msg), 0, _WM_KEYFIRST, _WM_KEYLAST, _PM_REMOVE):
         pass
 
 
-
-
-# Use GPU if availible: run with ".\venv\Scripts\python.exe"
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[INFO] Using device: {DEVICE}")
 
 
-
-"""
-Tello Interceptor main class. Handles all drone logic.
-"""
 class TelloInterceptor:
-    # Phantom mode -> Drone does not take off
+    """Drone orchestrator — owns Tello SDK, video loop, PIDs, FSM."""
+
     def __init__(self, phantom_mode: bool = False):
+        # phantom_mode=True: skip takeoff, run logic dry
         self.phantom_mode = phantom_mode
         self.tello        = Tello()
-        self._sdk_lock    = threading.Lock() # to avoid UDP socket conflicts with simultaneous SDK commands
+        self._sdk_lock    = threading.Lock()  # serialize SDK commands over UDP
         self._stop_finished = False
         self.video_active = False
         self.front_tof_active   = False
@@ -137,11 +130,7 @@ class TelloInterceptor:
 
         self.person_detector = PersonDetector(device=DEVICE)
 
-        # ---- Multi-target lock (Phase 8) ----
-        # ReidEmbedder loads OSNet x0_25 + MSMT17 weights from models/ (vendored
-        # in repo). If load fails (missing file / no GPU) the lock feature
-        # degrades to unavailable but the drone still flies normally (unlocked =
-        # biggest-bbox tracking, identical to prior behavior).
+        # ReID embedder (OSNet x0_25 + MSMT17 weights from models/). Init fail -> lock disabled, drone still flies.
         try:
             self.reid: Optional[ReidEmbedder] = ReidEmbedder(device=DEVICE)
         except Exception as exc:
@@ -150,19 +139,15 @@ class TelloInterceptor:
 
         self.lock = LockState()
 
-        # Pending intent flags from keyboard / webapp. Consumed once each video
-        # tick. Mirrors the existing _web_*_pending pattern.
-        # _lock_pending_at = (x_norm, y_norm) — click in video frame, lock the
-        # person whose bbox contains that point.
-        # _lock_pending_cycle — `I` key: lock biggest bbox if unlocked, else
-        # advance lock to next detection in left-to-right order.
-        # _lock_pending_clear — `C` key or web button: drop lock back to
-        # biggest-bbox default.
+        # Lock intents, consumed once per video tick.
+        #   _at: (x_norm, y_norm) click — lock bbox containing point
+        #   _cycle: 'I' key — lock biggest if unlocked, else advance L→R
+        #   _clear: 'C' key — drop lock
         self._lock_pending_at: Optional[tuple[float, float]] = None
         self._lock_pending_cycle: bool = False
         self._lock_pending_clear: bool = False
 
-        # Most recent lock match diagnostics (for telemetry + HUD).
+        # Lock diagnostics for telemetry/HUD
         self._last_lock_distance: float = -1.0
         self._last_lock_idx: Optional[int] = None
         self._last_persons_count: int = 0
@@ -175,40 +160,30 @@ class TelloInterceptor:
         self.pitch_pid =  PIDController(*GAINS_FORWARD_BACK_TOF_PID, output_min=-FB_MAX_VELOCITY_CM_S, output_max=FB_MAX_VELOCITY_CM_S)
         self.pitch_bbox_pid = PIDController(*GAINS_FORWARD_BACK_BBOX_PID, output_min=-FB_MAX_VELOCITY_CM_S, output_max=FB_MAX_VELOCITY_CM_S)
         self.roll_pid = PIDController(*GAINS_LEFT_RIGHT_PID, output_min=-LR_MAX_VELOCITY_CM_S, output_max=LR_MAX_VELOCITY_CM_S)
-        self.rc = [0, 0, 0, 0]  # left right, forward backward, up down, yaw
+        self.rc = [0, 0, 0, 0]  # lr, fb, ud, yaw
 
-        # last time the active target was visible
-        # Used to avoid switching to searching mode (no target detected) due to detection jitter
-
-        # EMA-smoothed target position for PIDs (kills YOLO ±5px jitter)
+        # EMA-smoothed target position — kills YOLO ±5px jitter before differentiating.
         self._target_smoothed_x_px: float = 0.0
         self._target_smoothed_y_px: float = 0.0
         self._target_ema_initialized: bool = False
 
-        # EMA-smoothed closeness signal for bbox pitch PID. Same TARGET_EMA_ALPHA as
-        # target x/y — closeness is computed from raw detection, jitters per frame.
-        # Without smoothing, Kd term spikes on YOLO noise and produces twitchy fb.
+        # EMA-smoothed closeness for bbox pitch PID. Raw closeness jitters -> Kd spikes -> twitchy fb.
         self._closeness_smoothed: float = 0.0
         self._closeness_ema_initialized: bool = False
 
-        # EMA-smoothed bbox center + width — roll PID dead-zone gate must be stable.
-        # Raw bbox edges jitter per YOLO frame → frame_center flickers in/out → roll on-off-on-off.
+        # EMA-smoothed bbox — roll dead-zone needs stable edges, raw bbox flickers.
         self._bbox_center_x_smoothed: float = 0.0
         self._bbox_width_smoothed: float = 0.0
         self._bbox_ema_initialized: bool = False
 
-        # Tracks last pitch PID source ("tof"|"bbox"|"none") to detect source switches.
-        # On switch, the incoming PID's error_last is seeded with current error so the
-        # first D-term doesn't spike off a stale error from a different unit system.
+        # Last pitch source ("tof"|"bbox"|"none"). On switch, seed error_last to dodge D-spike (different units).
         self._pitch_source_last: str = "none"
 
-        # ToF→bbox hysteresis: count consecutive invalid front-ToF frames. Stay in ToF
-        # mode (using last valid reading) until count exceeds threshold.
+        # ToF→bbox hysteresis — stay on cached ToF until N invalid frames in a row.
         self._tof_invalid_count: int = 0
         self._last_valid_front_tof_cm: float = -1.0
 
-        # Detection hysteresis: count consecutive frames target is missing.
-        # Keeps tracking_target True (using last smoothed values) for short YOLO dropouts.
+        # Detection hysteresis — keeps tracking_target True through short YOLO dropouts.
         self._tracking_miss_count: int = 0
 
         # Manual keyboard control
@@ -232,47 +207,32 @@ class TelloInterceptor:
         self._is_airborne: bool = False
         self._is_toggling_flight: bool = False
 
-        # ---- Search FSM ----
-        # Sub-states: "none" | "spin" | "advance"
-        # Greedy reactive spin: drone yaws until front ToF reads -1 (out of 120cm range = clear path),
-        # then advances forward until wall stop or PID settle, then spins again. Loops forever
-        # until target re-acquired (FSM resets in tracking branch) or battery dies.
-        # Only yaw runs during spin. Only pitch (fb) runs during advance. Altitude PID active throughout.
+        # Search FSM: "none" | "spin" | "advance". Spin until ToF clears, advance until wall, repeat.
+        # Yaw only during spin, fb only during advance. Altitude PID always on.
         self._search_state: str = "none"
         self._search_sub_state_t0: float = 0.0
 
-        # last time the active target was visible
-        # Used to avoid switching to searching mode (no target detected) due to detection jitter
+        # Last raw detection time — gates HOVER grace before SEARCH.
         self._last_target_seen_time: float = 0.0
 
-        # Last side target was seen on (-1 left, +1 right, 0 centered). Used for edge-loss recovery
-        # in grace branch + initial spin direction. Set in tracking branch each frame.
+        # Last side target was on (-1 left, +1 right, 0 centered). Edge-loss recovery + initial spin dir.
         self._last_target_side: int = 0
 
-        # Diagonal-wall mitigation: track prev front_tof reading + freeze timestamp.
-        # On valid → -1 transition, set freeze_until = now + FRONT_TOF_DISCONTINUITY_FREEZE_S.
-        # Safety block blocks fb>0 while freeze active. Catches drone flying past wall edge.
+        # Diagonal-wall guard — on valid→-1 ToF transition, freeze fb to dodge edge-flyby crash.
         self._front_tof_cm_prev: float = -1.0
         self._front_tof_freeze_until: float = 0.0
 
-        # Accumulated yaw angle during spin (deg). Spin exits when this reaches 360°
-        # — full rotation guarantees the camera has swept every direction at least once.
+        # Spin angle accumulator — exits at 360° (full camera sweep).
         self._search_spin_angle_deg: float = 0.0
 
-        # Advance sub-FSM (B + I): phases = "moving" | "sweeping". Distance cap + periodic sweep.
+        # Advance sub-FSM: "moving" | "sweeping". Distance cap + periodic sweep.
         self._advance_phase: str = "moving"
         self._advance_phase_t0: float = 0.0
         self._advance_last_sweep_t: float = 0.0
         self._advance_distance_cm: float = 0.0
         self._advance_sweep_obstacle: bool = False
 
-        # ---- Webapp integration ----
-        # latest_frame: last annotated BGR frame from _video_loop. FastAPI MJPEG
-        # endpoint reads this each tick, encodes JPEG, streams. None until first frame.
-        # current_mode_label: mirrors mode_label local var so web telemetry can show it.
-        # _web_*_pending: one-shot intent flags set by web_request_* methods. Consumed
-        # by _video_loop each tick by OR-ing into the matching keyboard rising_edge,
-        # so web and keyboard share the same downstream logic. No duplication.
+        # Webapp state — _web_*_pending flags OR'd into keyboard rising edges in _poll_keyboard.
         self.latest_frame = None
         self.current_mode_label: str = "init"
         self._web_takeoff_land_pending: bool = False
@@ -280,15 +240,10 @@ class TelloInterceptor:
         self._web_lock_pending: bool = False
         self._web_clear_lock_pending: bool = False
 
-        # Web manual control: heartbeat timestamp. web_set_manual_velocity()
-        # pushes this 0.3s into the future on each call. _poll_keyboard keeps
-        # the web-set manual_* values as long as now < _web_manual_until AND
-        # no keyboard key is pressed. Browser tab dies → no heartbeat → values
-        # zero within 0.3s → drone stops. Safety: never hangs on stale velocity.
+        # Web manual heartbeat — values zero if no fresh ping within WEB_MANUAL_HEARTBEAT_GRACE_S (dead-tab safety).
         self._web_manual_until: float = 0.0
 
-    # ---- Webapp control surface ----
-    # All four return immediately. _video_loop consumes the flag next tick.
+    # Webapp controls — set flag, _video_loop consumes next tick.
     def web_request_takeoff_land(self) -> None:
         """Toggle takeoff/land — same effect as pressing SPACE."""
         self._web_takeoff_land_pending = True
@@ -306,32 +261,21 @@ class TelloInterceptor:
         self._web_clear_lock_pending = True
 
     def web_lock_at(self, x_norm: float, y_norm: float) -> None:
-        """Lock onto the detection at (x_norm, y_norm) on the next video tick.
-
-        Coordinates are normalized [0, 1] relative to the displayed video
-        frame — the browser computes them from a click event on the <img>
-        feed. The video loop translates to pixel coords and finds the bbox
-        containing that point.
-        """
+        """Lock onto detection at click (x_norm, y_norm in [0,1] of video frame)."""
         x = max(0.0, min(1.0, float(x_norm)))
         y = max(0.0, min(1.0, float(y_norm)))
         self._lock_pending_at = (x, y)
 
     def web_request_stop(self) -> None:
-        """Trigger clean shutdown — same effect as pressing ESC."""
+        """Trigger clean shutdown: same effect as pressing ESC."""
         self.video_active = False
 
     def web_set_target(self, name: str) -> bool:
-        """Swap the active tracking target at runtime. Returns False on unknown name.
-
-        Reset PIDs + EMA state because the new target has a different
-        target_y_ratio + closeness scale; reusing prior integral / smoothed
-        values would produce an immediate spike.
-        """
+        """Swap active target. Returns False on unknown name. Resets PIDs+EMA (new setpoints would spike)."""
         ok = set_active_target(name)
         if not ok:
             return False
-        # Wipe smoothed + PID state so the switch doesn't pop the controller.
+        # Wipe PID + EMA so switch doesn't pop.
         self.altitude_target_pid.reset_integral()
         self.yaw_pid.reset_integral()
         self.pitch_pid.reset_integral()
@@ -343,13 +287,7 @@ class TelloInterceptor:
         return True
 
     def web_set_manual_velocity(self, lr: int, fb: int, ud: int, yaw: int) -> None:
-        """Set manual RC velocity from web dpad. Requires is_manual=True to take effect.
-
-        Each call refreshes the heartbeat by WEB_MANUAL_HEARTBEAT_S. Frontend
-        is expected to call this every ~100 ms while a dpad button is held,
-        and call once with all zeros on release. If the browser dies the
-        heartbeat lapses and _poll_keyboard zeros the velocities.
-        """
+        """Set manual RC velocity from web dpad. Needs is_manual=True. Each call refreshes heartbeat."""
         self.manual_lr  = int(lr)
         self.manual_fb  = int(fb)
         self.manual_ud  = int(ud)
@@ -382,10 +320,7 @@ class TelloInterceptor:
             "rc_fb":           self.rc[1],
             "rc_ud":           self.rc[2],
             "rc_yaw":          self.rc[3],
-            # locked_track_id: 0 = locked (no real per-track ID since YOLO is
-            # stateless; the lock is identity-by-embedding, not by index).
-            # Frontend treats non-null as "locked" and switches the video
-            # glow accordingly.
+            # 0=locked, None=not. Frontend uses non-null to flip video glow. No per-track ID (lock is by embedding).
             "locked_track_id": 0 if self.lock.is_locked else None,
             "lock_distance":   self._last_lock_distance,
             "lock_threshold":  LOCK_MATCH_THRESHOLD,
@@ -397,11 +332,8 @@ class TelloInterceptor:
             "available_targets": list(AVAILABLE_TARGETS.keys()),
         }
 
-    """
-    Starts drone connection, video stream, and all threads.
-    """
     def start(self):
-
+        """Connect drone, start streams + threads, run video loop."""
         print("[INFO] Connecting to Tello...")
         last_exc = None
         for attempt in range(1, 4):
@@ -420,7 +352,7 @@ class TelloInterceptor:
             ) from last_exc
         print(f"[INFO] Connected. Battery: {self.tello.get_battery()}%")
 
-        # Reset drone from previous run just in case
+        # Reset stale state from prior run.
         print("[INFO] Clearing stale state (land + streamoff)...")
         try:
             self.tello.send_rc_control(0, 0, 0, 0)
@@ -452,8 +384,8 @@ class TelloInterceptor:
         self.telemetry_active   = True
         self.rc_loop_active     = True
 
-        
-        # Video loop in main trhead, rc control, telemetry and sensor reading in separate threads.
+
+        # Video loop in main thread. RC, telemetry, ToF in daemons.
         threading.Thread(target=self._update_telemetry, daemon=True).start()
         threading.Thread(target=self._update_front_tof, daemon=True).start()
         threading.Thread(target=self._rc_control_loop, daemon=True).start()
@@ -461,15 +393,12 @@ class TelloInterceptor:
         self._video_loop()
 
 
-    """
-    Stops all threads and lands drone.
-    """
     def stop(self):
+        """Stop all threads, land drone."""
         if self._stop_finished:
             return
-        
-        # Kill ToF thread FIRST and wait for in-flight EXT tof? (timeout=1s) to drain.
-        # Otherwise its response gets queued and 'land'/'streamoff' read it instead of 'ok'.
+
+        # Kill ToF thread first — its in-flight "EXT tof?" reply would be popped by land/streamoff otherwise.
         self.front_tof_active = False
         self.rc_loop_active = False
         self.video_active = False
@@ -488,7 +417,7 @@ class TelloInterceptor:
             except TelloException as e:
                 print(f"[ERROR] Failed to land during shutdown: {e}")
 
-        # Do not use "end()" from djitellopy, it closes SDK socket and causes errors for subsequent runs.
+        # Avoid djitellopy.end() — closes SDK socket and breaks subsequent runs.
         time.sleep(0.6)
         try:
             with self._sdk_lock:
@@ -499,10 +428,8 @@ class TelloInterceptor:
             self._stop_finished = True
 
 
-    """
-    Main loop, handles video, detection, and intercept logic.
-    """
     def _video_loop(self):
+        """Main loop — video, detection, intercept logic."""
         import numpy as np
         cv2.namedWindow("TelloInterceptor", cv2.WINDOW_AUTOSIZE)
         cv2.imshow("TelloInterceptor", np.zeros((720, 960, 3), dtype=np.uint8))
@@ -523,9 +450,7 @@ class TelloInterceptor:
             if current_frame is not None:
                 current_frame = cv2.cvtColor(current_frame, cv2.COLOR_RGB2BGR)
 
-            """
-            Handle missing frames
-            """
+            # Handle missing frames
             if current_frame is None:
                 consecutive_none_frames += 1
                 if consecutive_none_frames > 300:
@@ -534,7 +459,7 @@ class TelloInterceptor:
                     break
                 cv2.waitKey(1)
 
-                # for manual keyboard control
+                # Keep keyboard responsive even on dead frames
                 self._poll_keyboard()
                 if self._esc_rising_edge:
                     self.video_active = False
@@ -543,50 +468,33 @@ class TelloInterceptor:
                 time.sleep(0.01)
                 continue
 
-            # Reset counter on successful frame
-            consecutive_none_frames = 0 
+            consecutive_none_frames = 0
 
 
-            """
-            Get frame center and target vertical setpoint
-            """
-            # derive true center from actual frame size
+            # Frame center + vertical setpoint (per-target framing).
             h, w = current_frame.shape[:2]
             frame_center_x = w // 2
             frame_center_y = h // 2
 
-            target_setpoint_y_px = int(h * TARGET.target_y_ratio)       # alt setpoint: per-target framing
+            target_setpoint_y_px = int(h * TARGET.target_y_ratio)
 
             frame_count += 1
 
 
-            """
-            Pose detection every YOLO_STRIDE frames
-            """
+            # Pose detection every YOLO_STRIDE frames.
             if frame_count % YOLO_FRAME_STRIDE == 0:
                 detected_persons = self.person_detector.detect_persons_in_frame(current_frame)
 
 
-
-
-            """
-            Multi-target lock:
-                1) Embed every detection with ReID model OSnetx0.25
-                2) Apply lock status for every frame
-                3) select_target_person picks the chosen person when locked, or biggest-bbox / nearest-to-last when unlocked.
-                4) If successful aply EMA smoothing to avoid ReID flickering
-            """
-
-            # Extract person crops from the frame
+            # Multi-target lock: embed detections -> apply pending intents -> select target -> EMA smooth.
             embeddings = None
             if self.reid is not None and detected_persons:
                 crops = [
                     crop_bbox(current_frame, p.x1, p.y1, p.x2, p.y2)
                     for p in detected_persons
                 ]
-   
-                # check all crops are valid 
-                # if detection box is None skip embedding to avoid ReID errors
+
+                # Skip embed if any crop invalid — ReID errors otherwise.
                 if all(c is not None for c in crops):
                     try:
                         embeddings = self.reid.embed_batch(crops)
@@ -618,19 +526,19 @@ class TelloInterceptor:
                 self._lock_pending_at = None
 
             if self._lock_pending_cycle and embeddings is not None and detected_persons:
-                # Left-to-right cycle order keeps cycling predictable across frames.
+                # L→R order keeps cycling predictable across frames.
                 order = sorted(
                     range(len(detected_persons)),
                     key=lambda i: detected_persons[i].bbox_center_x,
                 )
                 if not self.lock.is_locked:
-                    # Unlocked → lock onto biggest bbox (matches user's "no-lock" baseline).
+                    # Unlocked → lock biggest bbox.
                     target_idx = max(
                         range(len(detected_persons)),
                         key=lambda i: detected_persons[i].bbox_area_pixels,
                     )
                 else:
-                    # Locked → advance to next person in left-to-right order.
+                    # Locked → advance to next person L→R.
                     locked_vec = self.lock.embedding.flatten()
                     sims = embeddings @ locked_vec
                     import torch as _torch
@@ -655,9 +563,7 @@ class TelloInterceptor:
             self._last_lock_distance = lock_dist
             self._last_lock_idx = best_idx
 
-            # EMA-update the locked embedding on a confirmed match. Updating only
-            # when the match passed the threshold ensures the fingerprint can't
-            # drift onto a different person from a false positive.
+            # EMA-update locked embedding only on confirmed match — prevents drift onto false positive.
             if (self.lock.is_locked and best_person is not None
                     and best_idx is not None and embeddings is not None):
                 self.lock.update(
@@ -665,16 +571,14 @@ class TelloInterceptor:
                     (float(best_person.bbox_center_x), float(best_person.bbox_center_y)),
                 )
 
-            persons_to_draw = detected_persons  # draw all detections, mark the chosen one
+            persons_to_draw = detected_persons  # draw all, mark chosen
 
-            # Build web frame BEFORE HUD overlays land on current_frame.
+            # Web frame copy BEFORE HUD lands on current_frame.
             web_frame = current_frame.copy()
             draw_person_overlays(web_frame, persons_to_draw, TARGET,
                                  chosen_idx=best_idx, locked=self.lock.is_locked)
 
-            """
-            HUD overlays
-            """
+            # HUD overlays
             target_x_px, target_y_px, tracking_target, tracked_person = draw_person_overlays(
                 current_frame, persons_to_draw, TARGET,
                 chosen_idx=best_idx, locked=self.lock.is_locked,
@@ -701,8 +605,7 @@ class TelloInterceptor:
 
             tracking_target_raw = tracking_target and target_y_px is not None and target_x_px is not None
 
-            # Detection hysteresis: short YOLO confidence dips don't drop tracking_target.
-            # Within hysteresis window: keep tracking_target=True, hold last smoothed values.
+            # Detection hysteresis — short YOLO dips keep tracking_target=True with last smoothed values.
             if tracking_target_raw:
                 self._tracking_miss_count = 0
                 tracking_target = True
@@ -714,23 +617,17 @@ class TelloInterceptor:
                 )
 
 
-            """ 
-            Intercept logic and actuation
-                --- PID ---
-                Three modes:
-                INTERCEPTING — target visible, park target at TARGET.target_y_ratio via target PID
-                HOVER        — target lost < TARGET_LOST_GRACE_S ago, ud=0 (Tello holds via baro+optical-flow)
-                SEARCHING    — target lost > TARGET_LOST_GRACE_S, hold TARGET_ALTITUDE_CM via baro PID
-
-                YOLO detection jitter -> drone switches between intercepting and searching modes rapidly -> PID controller oscillates
-                Fix: grace period after target loss where drone enters HOVER mode
-            """
+            # Intercept FSM:
+            #   INTERCEPTING — target visible, target PID
+            #   HOVER        — target lost <TARGET_LOST_GRACE_S ago, ud=0 (Tello holds via baro+optical-flow)
+            #   SEARCHING    — lost longer, baro PID + spin/advance
+            # Grace HOVER avoids PID flapping on YOLO jitter.
             valid_front_tof = self.front_tof_cm > 0
 
             # pitch source latched across frames for D-term seeding on transitions
             pitch_source = "none"
 
-            # Each mode of the drone will compute the velocity commands this is just for safety
+            # Default velocities — overwritten by active mode.
             lr = 0
             fb = 0
             ud = 0
@@ -738,8 +635,7 @@ class TelloInterceptor:
 
             error_roll = 0.0
 
-            # Grounded -> skip autonomous FSM. No PID, no search spin. RC stays 0.
-            # Phantom mode dry-runs the FSM, so don't gate on airborne there.
+            # Grounded -> skip FSM. Phantom dry-runs FSM, so don't gate on airborne there.
             if not self._is_airborne and not self.phantom_mode:
                 mode_label = "grounded"
                 error_altitude = 0.0
@@ -766,8 +662,7 @@ class TelloInterceptor:
                 # Reset Search if target re-acquired after loss
                 self._search_state = "none"
 
-                # Raw measurements only when YOLO returned a fresh detection this frame.
-                # Within hysteresis window (raw miss) we hold last smoothed values instead.
+                # Raw measurements only on fresh detection — hysteresis holds last smoothed values otherwise.
                 if tracking_target_raw:
                     target_side = target_x_px - frame_center_x
                     if target_side > 0:
@@ -775,7 +670,7 @@ class TelloInterceptor:
                     elif target_side < 0:
                         self._last_target_side = -1
 
-                    # EMA smooth target position to kill YOLO jitter before differentiating
+                    # EMA smooth target position — kills YOLO jitter before D-term.
                     if not self._target_ema_initialized:
                         self._target_smoothed_x_px = float(target_x_px)
                         self._target_smoothed_y_px = float(target_y_px)
@@ -786,7 +681,7 @@ class TelloInterceptor:
                         self._target_smoothed_y_px = (TARGET_EMA_ALPHA * target_y_px +
                                                       (1.0 - TARGET_EMA_ALPHA) * self._target_smoothed_y_px)
 
-                # EMA-smooth closeness same way (bbox PID consumes it when ToF fallback fires)
+                # EMA-smooth closeness (bbox PID consumes it on ToF fallback).
                 if tracking_target_raw and tracked_person is not None and TARGET.is_visible(tracked_person):
                     raw_closeness = TARGET.closeness(tracked_person)
                     if not self._closeness_ema_initialized:
@@ -796,7 +691,7 @@ class TelloInterceptor:
                         self._closeness_smoothed = (TARGET_EMA_ALPHA * raw_closeness +
                                                     (1.0 - TARGET_EMA_ALPHA) * self._closeness_smoothed)
 
-                # EMA-smooth bbox center + width — roll PID dead-zone needs stable edges
+                # EMA-smooth bbox — roll dead-zone needs stable edges.
                 if tracking_target_raw and tracked_person is not None:
                     raw_center = float(tracked_person.bbox_center_x)
                     raw_width = float(tracked_person.bbox_width_pixels)
@@ -811,7 +706,6 @@ class TelloInterceptor:
                                                     (1.0 - TARGET_EMA_ALPHA) * self._bbox_width_smoothed)
 
                 # --- Target Altitude PID ---
-                # All errors use convention: error = target - measurement, then adjust gains sign accordingly
                 error_altitude = self._target_smoothed_y_px - target_setpoint_y_px
                 ud = self.altitude_target_pid.compute(error_altitude, RC_LOOP_INTERVAL_S)
 
@@ -822,8 +716,7 @@ class TelloInterceptor:
 
 
                 # --- Pitch PID ---
-                # ToF hysteresis: cache last valid reading; stay in ToF mode until
-                # N consecutive invalid frames seen. Stops ToF↔bbox flicker at edge of range.
+                # ToF hysteresis — stay on cached ToF until N invalid frames (stops ToF↔bbox flicker).
                 if valid_front_tof:
                     self._tof_invalid_count = 0
                     self._last_valid_front_tof_cm = self.front_tof_cm
@@ -835,7 +728,7 @@ class TelloInterceptor:
                     front_tof_for_pid = self.front_tof_cm if valid_front_tof else self._last_valid_front_tof_cm
                     error_pitch = INTERCEPT_DISTANCE_CM - front_tof_for_pid
 
-                    # Switching INTO ToF: seed error_last so D-term doesn't spike off stale ratio-unit err.
+                    # ToF entry: seed error_last so D-term doesn't spike off stale ratio-unit err.
                     if self._pitch_source_last != "tof":
                         self.pitch_pid.error_last = error_pitch
 
@@ -846,7 +739,7 @@ class TelloInterceptor:
                     pitch_source = "bbox"
                     closeness_value = self._closeness_smoothed
                     error_pitch = TARGET.closeness_setpoint - closeness_value
-                    # Switching INTO bbox: seed error_last to avoid D-spike off stale cm-unit err.
+                    # bbox entry: seed error_last to avoid D-spike off stale cm-unit err.
                     if self._pitch_source_last != "bbox":
                         self.pitch_bbox_pid.error_last = error_pitch
                     fb = self.pitch_bbox_pid.compute(error_pitch, RC_LOOP_INTERVAL_S)
@@ -860,8 +753,8 @@ class TelloInterceptor:
                     self.pitch_bbox_pid.reset_integral()
 
 
-                #--- Roll PID ---
-                # Use EMA-smoothed bbox so dead-zone edges don't flicker per YOLO frame.
+                # --- Roll PID ---
+                # EMA-smoothed bbox so dead-zone edges don't flicker per YOLO frame.
                 bbox_half = self._bbox_width_smoothed / 2
                 bbox_left  = self._bbox_center_x_smoothed - bbox_half
                 bbox_right = self._bbox_center_x_smoothed + bbox_half
@@ -875,18 +768,17 @@ class TelloInterceptor:
                     lr = self.roll_pid.compute(error_roll, RC_LOOP_INTERVAL_S)
 
 
-            # target not visible but seen recently -> grace period, hover instead of searching
+            # Lost target but seen recently -> HOVER grace period
             elif self._last_target_seen_time > 0 and (time.time() - self._last_target_seen_time) < TARGET_LOST_GRACE_S:
                 mode_label = "hover"
 
-                # altitude
+                # altitude — let Tello hold it via baro+optical-flow
                 error_altitude = 0.0
-                ud = 0.0  # hover — let Tello hold altitude itself
+                ud = 0.0
                 self.altitude_pid.reset_integral()
                 self.altitude_target_pid.reset_integral()
 
-                # yaw — edge-loss recovery. If target vanished off-side, yaw toward last-seen
-                # side to catch them stepping past frame edge. Centered loss → no yaw.
+                # yaw — edge-loss recovery. Off-side loss => yaw toward last-seen side. Centered loss => no yaw.
                 error_yaw = 0.0
                 yaw = self._last_target_side * GRACE_RECOVERY_YAW_DEG_S
                 self.yaw_pid.reset_integral()
@@ -900,25 +792,25 @@ class TelloInterceptor:
                 self.pitch_pid.reset_integral()
                 self.pitch_bbox_pid.reset_integral()
 
-                # EMA — next target = fresh start for both position + closeness + bbox
+                # Reset EMA — next acquisition is a fresh target
                 self._target_ema_initialized = False
                 self._closeness_ema_initialized = False
                 self._bbox_ema_initialized = False
 
 
-            # target not visible and not in grace -> searching mode
+            # Lost beyond grace -> SEARCH
             else:
                 mode_label = "searching"
                 error_altitude = TARGET_ALTITUDE_CM - self.height_cm  # cm (+ve = below target)
 
-                # altitude PID — baro
+                # Baro-based altitude hold during search.
                 self.altitude_target_pid.reset_integral()
                 self._target_ema_initialized = False
                 self._closeness_ema_initialized = False
                 self._bbox_ema_initialized = False
                 ud = self.altitude_pid.compute(error_altitude, RC_LOOP_INTERVAL_S)
 
-                # roll, pitch bbox, yaw — not active during search; reset integrals to avoid wind-up carry-over
+                # Roll / bbox-pitch / yaw inactive — reset integrals to avoid wind-up.
                 self.roll_pid.reset_integral()
                 self.pitch_bbox_pid.reset_integral()
                 self.yaw_pid.reset_integral()
@@ -926,32 +818,28 @@ class TelloInterceptor:
                 error_pitch = 0.0
                 pitch_source = "none"
 
-                # ---- Search  ----
-                # start searching
+                # Search FSM
                 if self._search_state == "none":
                     self._search_state = "spin"
                     self._search_sub_state_t0 = time.time()
                     self._search_spin_angle_deg = 0.0
 
                 if self._search_state == "spin":
-                    # First spin direction = last-seen side (target most likely there).
-                    # _last_target_side defaults 0; treat 0 as +1 (CW) for fresh boot.
+                    # Spin toward last-seen side. Default 0 -> +1 (CW) on fresh boot.
                     spin_sign = self._last_target_side if self._last_target_side != 0 else 1
                     yaw = spin_sign * SEARCH_SPIN_VELOCITY_DEG_S
                     fb  = 0.0
 
-                    # Accumulate spin angle. Full 360° guarantees camera swept every
-                    # direction → maximizes chance of re-acquiring target before advancing.
+                    # Spin 360° before advancing — full camera sweep.
                     self._search_spin_angle_deg += SEARCH_SPIN_VELOCITY_DEG_S * RC_LOOP_INTERVAL_S
 
                     if self._search_spin_angle_deg >= 360.0:
                         yaw = 0.0
                         self._search_state = "advance"
                         self._search_sub_state_t0 = time.time()
-                        # Fresh PID state — advance is a new control task
+                        # Fresh PID state — advance is a new control task.
                         self.pitch_pid.reset_integral()
                         self.pitch_pid.error_last = 0.0
-                        # Init advance sub-FSM
                         self._advance_phase = "moving"
                         self._advance_phase_t0 = time.time()
                         self._advance_last_sweep_t = time.time()
@@ -960,8 +848,8 @@ class TelloInterceptor:
 
 
                 elif self._search_state == "advance":
-                    # Advance sub-FSM: "moving" pushes forward, "sweeping" pauses fb to yaw ±arc
-                    # checking ToF for diagonal walls. Distance cap forces periodic re-spin.
+                    # Advance: "moving" = fb forward. "sweeping" = pause + yaw arc to scan for diagonal walls.
+                    # Distance cap forces periodic re-spin.
                     now = time.time()
                     yaw = 0.0
 
@@ -971,13 +859,13 @@ class TelloInterceptor:
                             pitch_source = "tof"
                             fb = max(0.0, self.pitch_pid.compute(error_pitch, RC_LOOP_INTERVAL_S))
                         else:
-                            # ToF out-of-range = no obstacle within sensor range = open space ahead.
+                            # ToF out-of-range = no obstacle = open space ahead.
                             error_pitch = 0.0
                             pitch_source = "none"
                             fb = SEARCH_OPEN_SPACE_VELOCITY_CM_S
                             self.pitch_pid.reset_integral()
 
-                        # Distance integration (approx — uses RC tick interval as dt, conservative)
+                        # Approx distance integration — RC tick interval as dt (conservative).
                         self._advance_distance_cm += fb * RC_LOOP_INTERVAL_S
 
                         settled = valid_front_tof and abs(INTERCEPT_DISTANCE_CM - self.front_tof_cm) < SEARCH_ADVANCE_TOLERANCE_CM
@@ -997,9 +885,9 @@ class TelloInterceptor:
                         fb = 0.0
                         elapsed = now - self._advance_phase_t0
                         leg_s = SEARCH_ADVANCE_SWEEP_ARC_DEG / SEARCH_ADVANCE_SWEEP_YAW_DEG_S
-                        # leg1 0..leg_s: yaw + (right by arc)
-                        # leg2 leg_s..3*leg_s: yaw - (left back to -arc)
-                        # leg3 3*leg_s..4*leg_s: yaw + (return to 0)
+                        # leg1 [0,leg_s):    +arc to the right
+                        # leg2 [leg_s,3*leg_s): swing back through 0 to -arc
+                        # leg3 [3*leg_s,4*leg_s): return to 0
                         if elapsed < leg_s:
                             yaw = SEARCH_ADVANCE_SWEEP_YAW_DEG_S
                         elif elapsed < 3 * leg_s:
@@ -1009,7 +897,7 @@ class TelloInterceptor:
                         else:
                             yaw = 0.0
                             if self._advance_sweep_obstacle:
-                                # Diagonal wall detected during sweep → abort advance, re-spin
+                                # Diagonal wall seen during sweep -> abort advance, re-spin.
                                 self._search_state = "spin"
                                 self._search_sub_state_t0 = now
                                 self._search_spin_angle_deg = 0.0
@@ -1017,12 +905,11 @@ class TelloInterceptor:
                                 self._advance_phase = "moving"
                                 self._advance_last_sweep_t = now
 
-                        # Watch ToF during sweep — any close reading = off-axis wall
+                        # Watch ToF during sweep — close reading = off-axis wall.
                         if valid_front_tof and self.front_tof_cm <= SEARCH_ADVANCE_SWEEP_WALL_CM:
                             self._advance_sweep_obstacle = True
 
-            # Manual keyboard override — replaces PID output before safety clamp.
-            # Safety blocks below still apply on top, keyboard cannot bypass them.
+            # Manual override — replaces PID output. Safety blocks below still apply.
             if self.is_manual:
                 mode_label = "manual"
                 lr = self.manual_lr
@@ -1030,24 +917,20 @@ class TelloInterceptor:
                 ud = self.manual_ud
                 yaw = self.manual_yaw
 
-            # Altitude Safety, dead-reckoning XY dropped (unreliable on Tello)
+            # Altitude safety — XY dead-reckoning dropped (unreliable on Tello).
             if self.height_cm >= MAX_TRACKING_ALTITUDE_CM and ud > 0:
-                ud = 0  # Block climbing above ceiling
+                ud = 0  # block climb above ceiling
             elif 0 < self.height_cm <= MIN_TRACKING_ALTITUDE_CM and ud < 0:
-                ud = 0  # Block descending below floor
+                ud = 0  # block descent below floor
 
-            # Forward Back Safety — stop at wall, no reverse (no rear ToF on Tello).
-            # Search-mode fb already clamped >=0 in advance state; intercept mode may still
-            # produce negative fb, which is allowed here (only forward push is wall-gated).
+            # Fb safety — wall stop forward, no reverse (no rear ToF). Negative fb allowed.
             if valid_front_tof:
                 if self.front_tof_cm <= FRONT_TOF_WALL_STOP_CM and fb > 0:
                     fb = 0
                     self.pitch_pid.reset_integral()
                     self.pitch_bbox_pid.reset_integral()
 
-            # Diagonal-wall mitigation: if front ToF just dropped from valid → -1, drone likely
-            # crossed past a wall edge (narrow cone now looking past it). Block forward fb until
-            # freeze window expires — gives drone time to either re-acquire wall or move clear.
+            # Diagonal-wall guard — valid→-1 ToF transition = drone past wall edge. Block fb until freeze ends.
             if time.time() < self._front_tof_freeze_until and fb > 0:
                 fb = 0
                 self.pitch_pid.reset_integral()
@@ -1058,69 +941,58 @@ class TelloInterceptor:
             self.rc[2] = int(round(ud))
             self.rc[3] = int(round(yaw))
 
-            # for debug
+            # debug
             #print(self.rc[1], self.front_tof_cm)
 
             # Latch pitch source for next-frame transition detection (D-term seeding).
             self._pitch_source_last = pitch_source
 
-            # Expose minimal web frame (bbox + conf + lock only) for webapp.
-            # cv2.imshow below uses fully-annotated current_frame.
-            # Single-attr assignment is atomic in CPython, no lock needed.
+            # Web frame = minimal overlays. cv2 shows fully-annotated. Atomic assign, no lock.
             self.latest_frame = web_frame
             self.current_mode_label = mode_label
 
             cv2.imshow("TelloInterceptor", current_frame)
-            # Pump cv2 render. _poll_keyboard() drains key messages so cv2
-            # doesn't freeze when a movement key is held.
+            # Pump cv2 render. _poll_keyboard drains key msgs so cv2 doesn't freeze on held key.
             cv2.waitKey(1)
             self._poll_keyboard()
 
-            # ESC — exit always, regardless of mode
+            # ESC -> exit, always.
             if self._esc_rising_edge:
                 self.video_active = False
                 break
-            # Window-X also exits — useful when terminal has focus and ESC won't fire
+            # Window-X also exits — useful when terminal has focus and ESC won't fire.
             if cv2.getWindowProperty("TelloInterceptor", cv2.WND_PROP_VISIBLE) < 1:
                 self.video_active = False
                 break
 
-            # SPACE — takeoff / land toggle. Threaded + _sdk_lock to avoid SDK socket clash.
-            # Clears djitellopy's response queue first — stale "unknown command: keepalive" or
-            # "tof N" responses from prior commands pollute the queue and get popped instead
-            # of the real takeoff/land "ok" response, causing djitellopy's 4-retry fail.
+            # SPACE — takeoff/land toggle. Threaded + _sdk_lock to avoid SDK clash.
+            # Clears djitellopy response queue first — stale "keepalive"/"tof N" gets popped
+            # instead of the real "ok", causing 4-retry fail.
             if self._space_rising_edge and not self.phantom_mode:
                 if not self._is_toggling_flight:
                     self._is_toggling_flight = True
                     def _toggle_flight():
                         try:
-                            # Re-init SDK mode in case the drone rebooted or timed out of SDK mode. 
-                            # Do this outside the main lock so we don't hold up other threads on timeout.
+                            # Re-enter SDK mode in case drone rebooted or timed out. Outside main lock — don't block on timeout.
                             try:
                                 self.tello.send_control_command("command", timeout=1)
                             except Exception:
-                                pass # Ignore timeout, standard djitellopy connect() already does this
-                                
+                                pass  # timeout fine, connect() already did this
+
                             with self._sdk_lock:
-                                # Ensure we don't accidentally pop earlier unrelated responses
+                                # Clear stale unrelated responses from queue.
                                 if 'responses' in self.tello.get_own_udp_object():
                                     self.tello.get_own_udp_object()['responses'].clear()
-                                
+
                                 if self._is_airborne:
-                                    # Optimistic: assume land() works at hardware level even if
-                                    # SDK pops the wrong response and raises. Flip flag first.
+                                    # Optimistic: land() executes at hardware level even if SDK raises. Flip flag first.
                                     self._is_airborne = False
                                     self.tello.land()
                                 else:
-                                    # Optimistic: drone hardware accepts takeoff before djitellopy
-                                    # confirms via UDP. Stale "keepalive" / "tof N" in response
-                                    # queue can make takeoff() raise even though drone lifted.
+                                    # Optimistic: drone lifts before djitellopy confirms over UDP. Stale queue can raise.
                                     # Flip flag first so RC loop + FSM aren't dead-locked grounded.
                                     self._is_airborne = True
-                                    # Zero manual sticks + wipe PID integrals so whichever
-                                    # mode is active post-takeoff (auto or manual) starts
-                                    # clean. Mode itself preserved — operator picks before
-                                    # takeoff and that choice stands.
+                                    # Zero sticks + reset PIDs — clean start regardless of post-takeoff mode.
                                     self.manual_lr = self.manual_fb = self.manual_ud = self.manual_yaw = 0
                                     self.altitude_pid.reset_integral()
                                     self.altitude_target_pid.reset_integral()
@@ -1130,15 +1002,14 @@ class TelloInterceptor:
                                     self.roll_pid.reset_integral()
                                     self.tello.takeoff()
                         except TelloException as e:
-                            # Flag already flipped pre-call. Hardware likely executed the command
-                            # even though SDK raised (response queue race). Leave flag as-is —
-                            # reflects real drone state better than reverting on SDK noise.
+                            # Flag already flipped. Hardware likely executed; SDK raised on queue race.
+                            # Don't revert — reflects real drone state better.
                             print(f"[WARN] takeoff/land SDK raised (flag kept): {e}")
                         finally:
                             self._is_toggling_flight = False
                     threading.Thread(target=_toggle_flight, daemon=True).start()
 
-            # M — toggle manual mode + reset all PIDs to avoid I-term pop on switch
+            # M — toggle manual + reset PIDs to avoid I-term pop on switch.
             if self._m_rising_edge:
                 self.is_manual = not self.is_manual
                 self.manual_lr = self.manual_fb = self.manual_ud = self.manual_yaw = 0
@@ -1149,10 +1020,8 @@ class TelloInterceptor:
                 self.pitch_bbox_pid.reset_integral()
                 self.roll_pid.reset_integral()
 
-            # I — lock-cycle. Unlocked: lock biggest bbox. Locked: advance to
-            # next person in left-to-right order. Actual application happens
-            # at the top of the next video tick where embeddings are fresh.
-            # C — clear lock back to biggest-bbox default behavior.
+            # I — lock-cycle (biggest if unlocked, else next person L→R). Applied next tick with fresh embeddings.
+            # C — clear lock (back to biggest-bbox default).
             if self._i_rising_edge:
                 if self.reid is None:
                     print("[WARN] ReID embedder unavailable; lock disabled.")
@@ -1184,9 +1053,7 @@ class TelloInterceptor:
         self._i_was_pressed     = i_now
         self._c_was_pressed     = c_now
 
-        # Web overrides: OR pending intent flags into rising edges. Web and keyboard
-        # share the same downstream handler logic. Clear after OR so a held flag
-        # doesn't fire every tick.
+        # Web overrides — OR pending flags into rising edges, clear after so a held flag doesn't refire.
         if self._web_takeoff_land_pending:
             self._space_rising_edge = True
             self._web_takeoff_land_pending = False
@@ -1204,9 +1071,7 @@ class TelloInterceptor:
             self.manual_lr = self.manual_fb = self.manual_ud = self.manual_yaw = 0
             return
 
-        # Keyboard wins if any movement key held — operator at the PC has
-        # immediate priority. Otherwise the web dpad's last values stand for
-        # as long as its heartbeat is fresh. Otherwise zero (idle).
+        # Priority: keyboard > web dpad > idle. PC operator wins on key press.
         kb_any = any(_is_key_pressed(k) for k in (
             _VK_W, _VK_S, _VK_A, _VK_D, _VK_Q, _VK_E, _VK_UP, _VK_DOWN,
         ))
@@ -1231,33 +1096,31 @@ class TelloInterceptor:
             # Web heartbeat fresh — leave manual_* as web_set_manual_velocity set them.
             pass
         else:
-            # Both idle. Stop drone.
+            # Both idle -> stop.
             self.manual_lr = self.manual_fb = self.manual_ud = self.manual_yaw = 0
 
     def _update_front_tof(self):
     
         while self.front_tof_active:
             try:
-                # frontward ToF — single short critical section, then release lock
+                # Front ToF — short critical section, release lock immediately.
                 with self._sdk_lock:
                     raw = self.tello.send_command_with_return("EXT tof?", timeout=1)
                 if raw and raw.strip().startswith("tof "):
                     mm = int(raw.strip().split()[1])
                     new_front_tof_cm = -1.0 if mm >= 8190 else mm / 10.0
-                    # Discontinuity trigger: valid prev reading → -1 in single poll = likely past wall edge.
-                    # Freeze fb in safety block for FRONT_TOF_DISCONTINUITY_FREEZE_S to dodge diagonal crash.
+                    # Valid→-1 transition = likely past wall edge. Freeze fb to dodge diagonal crash.
                     if self._front_tof_cm_prev > 0 and new_front_tof_cm == -1.0:
                         self._front_tof_freeze_until = time.time() + FRONT_TOF_DISCONTINUITY_FREEZE_S
                     self._front_tof_cm_prev = new_front_tof_cm
                     self.front_tof_cm = new_front_tof_cm
 
-                # downward ToF + baro — read from state listener (no SDK command, no lock)
+                # Down ToF + baro — state listener, no SDK command, no lock.
                 state = self.tello.get_current_state()
                 if state:
                     self.down_tof_cm = state.get("tof", -1)
-                    # Tello reports magic OOR value (often 6553) when down ToF out-of-range.
-                    # Treat anything >= 400 cm as invalid — indoor ceiling never that high,
-                    # and unfiltered spike pollutes height_cm → altitude PID saturates → drone slams down.
+                    # Tello reports OOR (often 6553) when down ToF out-of-range. >=400 cm = invalid.
+                    # Unfiltered spike would pollute height_cm -> altitude PID saturates -> drone slams down.
                     if self.down_tof_cm >= 400:
                         self.down_tof_cm = -1
                     baro_cm = state.get("h", -1)
@@ -1295,15 +1158,10 @@ class TelloInterceptor:
                 pass
             time.sleep(0.2)
 
-    # Thread: runs at 20 Hz, just sends rc[]. No computation here.
     def _rc_control_loop(self) -> None:
-        """Send RC commands to drone at 20 Hz independent of video FPS.
-
-        In phantom mode, becomes a pure no-op — rc[] still updates from video loop
-        and shows in HUD, but never reaches the drone.
-        """
+        """Send RC at 20 Hz, decoupled from video FPS. Phantom mode = no-op (rc[] still updates for HUD)."""
         while self.rc_loop_active:
             if not self.phantom_mode and self._is_airborne:
                 with self._sdk_lock:
                     self.tello.send_rc_control(*self.rc)
-            time.sleep(RC_LOOP_INTERVAL_S)  # 0.05 s → 20 Hz
+            time.sleep(RC_LOOP_INTERVAL_S)  # 0.05 s -> 20 Hz

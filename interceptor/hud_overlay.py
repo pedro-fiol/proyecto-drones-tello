@@ -1,8 +1,5 @@
 """
-interceptor/hud_overlay.py
-
 Pure OpenCV drawing functions for the video HUD overlay.
-No Tello SDK calls, no threading, no state — just frame annotation.
 
 `draw_person_overlays` selects which Person is the tracking target using the
 provided Target instance (see interceptor.target). Tracked person is also
@@ -34,10 +31,8 @@ COLOR_TELEMETRY_PRIMARY = (0, 200, 255)
 COLOR_TELEMETRY_SECONDARY = (150, 150, 255)
 COLOR_MANUAL_BADGE = (0, 220, 255)    # yellow-ish
 COLOR_AUTO_BADGE = (180, 180, 180)    # grey
-
-# Multi-target lock palette
-COLOR_DECOY_BOX = (140, 140, 140)     # grey — non-chosen detections
-COLOR_LOCKED_BOX = (0, 220, 255)      # bright yellow — locked + matched
+COLOR_DECOY_BOX = (140, 140, 140)     # grey: non-chosen detections
+COLOR_LOCKED_BOX = (0, 220, 255)      # bright yellow: locked + matched
 COLOR_LOCK_LABEL = (0, 0, 0)          # black text on yellow background
 
 
@@ -52,30 +47,27 @@ def draw_person_overlays(
     Draw bbox + label + target dot for every detected person.
 
     With multi-target lock, all detections are drawn:
-      * chosen_idx (the active tracking target) gets the full-color (or
-        yellow-locked) thick box plus the target point dot;
-      * all other detections get a thin grey "decoy" box so the operator
-        can see candidates but knows which one the drone is tracking.
+        - chosen_idx: locked target, orange color and point
+        - all other detectetion get grey bbox
 
     Args:
-        frame: BGR HxWx3 uint8 array, drawn in-place.
-        persons: every YOLO detection this frame.
-        target: active Target (visibility predicate + point extractor).
-        chosen_idx: index into `persons` of the person being tracked, or
+        - frame: drone video frame
+        - persons: every YOLO detection in that frame.
+        - target: active Target.
+        - chosen_idx: index of the person being tracked, or
             None when nothing is being tracked (unlocked + no detections, or
-            locked + no match this frame). When None, every person is drawn
-            as a decoy.
-        locked: True when LockState.is_locked. Changes the chosen bbox to the
+            locked + no match this frame).
+        - locked: True when LockState.is_locked. Changes the chosen bbox to the
             yellow LOCK palette so the operator sees the lock is engaged
             even between matches.
 
     Returns (target_x, target_y, tracking, tracked_person):
-        target_x, target_y — pixel coords of the active target point on the
+        - target_x, target_y pixel coords of the active target point on the
             chosen person, or (None, None) when nothing's chosen / chosen
             person's target isn't visible (fallback to bbox center then).
-        tracking — True when chosen_idx is not None AND target.is_visible
+        - tracking: True when chosen_idx is not None AND target.is_visible
             on persons[chosen_idx]. Mirrors prior single-person semantics.
-        tracked_person — persons[chosen_idx] or None. Orchestrator uses this
+        - tracked_person: persons[chosen_idx] or None. TelloInterceptor uses this
             for pitch-PID closeness signal.
     """
     target_x: Optional[int] = None

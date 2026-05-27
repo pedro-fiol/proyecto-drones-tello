@@ -1,12 +1,8 @@
 """
-interceptor/perception.py
+YOLOv8-pose. Pure perception layer: takes a BGR camera frame, returns
+structured `Person` detections. 
 
-YOLOv8-pose wrapper. Pure perception layer: takes a BGR camera frame, returns
-structured `Person` detections. No Tello SDK calls, no threading, no drawing.
-
-Exposed keypoints: nose, eyes, ears, shoulders. The orbit logic in Phase 7 needs
-the ears to decide which side to fly around a person; exposing them now keeps
-the data model stable.
+Exposed keypoints: nose, eyes, ears, shoulders. 
 """
 
 from __future__ import annotations
@@ -125,7 +121,7 @@ class PersonDetector:
     def detect_persons_in_frame(self, frame) -> list[Person]:
         """Run plain YOLO detection on one BGR frame and return persons.
 
-        No tracker — stateless per-frame inference. Caller handles identity
+        No tracker: stateless per-frame inference. Caller handles identity
         across frames via EMA / nearest-point heuristics.
         """
         results = self.model.predict(

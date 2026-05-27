@@ -1,4 +1,4 @@
-"""interceptor/pid_controller.py — generic discrete PID controller."""
+"""PID controller."""
 
 
 class PIDController:
@@ -42,11 +42,7 @@ class PIDController:
         return output
 
     def reset_integral(self) -> None:
-        """Zero the integral accumulator. Call when target lost or FSM state changes.
-
-        Intentionally does NOT touch error_last / derivative_error: zeroing them
-        causes a one-frame D-term spike on resume (error - 0 / dt is huge), which
-        slams ud/fb. EMA smoothing on inputs already absorbs detection flicker —
-        the stale-error-last concern was over-stated.
+        """
+        Zero the integral accumulator. Call when target lost or FSM state changes.
         """
         self.integral_error = 0.0
