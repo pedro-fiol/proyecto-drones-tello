@@ -12,34 +12,64 @@ Cada escena se ha grabado con **tres POVs simultáneos**:
 - **POV 3: Móvil externo**
 
 ### 1. Controles manuales
-|                                 | iPad                          | Móvil externo                  |
-| ------------------------------- | ----------------------------- | ------------------------------ |
-| ![](media/01_manual_laptop.mp4) | ![](media/01_manual_ipad.mp4) | ![](media/01_manual_phone.mp4) |
+<table>
+<tr><th>Portátil</th><th>iPad</th><th>Móvil externo</th></tr>
+<tr>
+<td><video src="media/01_manual_laptop.mp4" controls width="300"></video></td>
+<td><video src="media/01_manual_ipad.MOV" controls width="300"></video></td>
+<td><em>pendiente</em></td>
+</tr>
+</table>
 
 ### 2. Tracking sin lock
-| Portátil                        | iPad                          | Móvil externo                  |
-| ------------------------------- | ----------------------------- | ------------------------------ |
-| ![](media/02_nolock_laptop.mp4) | ![](media/02_nolock_ipad.mp4) | ![](media/02_nolock_phone.mp4) |
+<table>
+<tr><th>Portátil</th><th>iPad</th><th>Móvil externo</th></tr>
+<tr>
+<td><em>pendiente</em></td>
+<td><video src="media/02_nolock_ipad.mp4" controls width="300"></video></td>
+<td><em>pendiente</em></td>
+</tr>
+</table>
 
 ### 3. Multi-target + switch de lock
-| Portátil                        | iPad                          | Móvil externo                  |
-| ------------------------------- | ----------------------------- | ------------------------------ |
-| ![](media/03_switch_laptop.mp4) | ![](media/03_switch_ipad.mp4) | ![](media/03_switch_phone.mp4) |
+<table>
+<tr><th>Portátil</th><th>iPad</th><th>Móvil externo</th></tr>
+<tr>
+<td><em>pendiente</em></td>
+<td><video src="media/03_switch_ipad.MOV" controls width="300"></video></td>
+<td><em>pendiente</em></td>
+</tr>
+</table>
 
 ### 4. Interceptación sólo del objetivo bloqueado
-| Portátil                          | iPad                            | Móvil externo                    |
-| --------------------------------- | ------------------------------- | -------------------------------- |
-| ![](media/04_lockonly_laptop.mp4) | ![](media/04_lockonly_ipad.mp4) | ![](media/04_lockonly_phone.mp4) |
+<table>
+<tr><th>Portátil</th><th>iPad</th><th>Móvil externo</th></tr>
+<tr>
+<td><em>pendiente</em></td>
+<td><video src="media/04_lock_only_ipad.MOV" controls width="300"></video></td>
+<td><em>pendiente</em></td>
+</tr>
+</table>
 
 ### 5. Búsqueda dirigida al lock
-| Portátil                            | iPad                              | Móvil externo                      |
-| ----------------------------------- | --------------------------------- | ---------------------------------- |
-| ![](media/05_searchlock_laptop.mp4) | ![](media/05_searchlock_ipad.mp4) | ![](media/05_searchlock_phone.mp4) |
+<table>
+<tr><th>Portátil</th><th>iPad</th><th>Móvil externo</th></tr>
+<tr>
+<td><em>pendiente</em></td>
+<td><video src="media/05_searchlock_ipad.mp4" controls width="300"></video></td>
+<td><em>pendiente</em></td>
+</tr>
+</table>
 
 ### 6. Demo del algoritmo de búsqueda completo
-| Portátil                           | iPad                             | Móvil externo                     |
-| ---------------------------------- | -------------------------------- | --------------------------------- |
-| ![](media/06_searchfsm_laptop.mp4) | ![](media/06_searchfsm_ipad.mp4) | ![](media/06_searchfsm_phone.mp4) |
+<table>
+<tr><th>Portátil</th><th>iPad</th><th>Móvil externo</th></tr>
+<tr>
+<td><em>pendiente</em></td>
+<td><video src="media/06_searchfsm_ipad.mp4" controls width="300"></video></td>
+<td><em>pendiente</em></td>
+</tr>
+</table>
 
 ---
 
