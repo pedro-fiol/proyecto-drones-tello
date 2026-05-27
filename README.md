@@ -100,8 +100,7 @@ Cada escena grabada desde dos POVs (tres en la escena 6):
 | Sensores propios | Barómetro, ToF inferior, IMU (pitch / roll / yaw / aceleraciones) |
 | Sensor añadido   | ToF frontal vía `EXT tof?` del kit de expansión                   |
 
-> 📷 **[Foto del dron equipado — `fototello1.jpeg` / `fototello2.jpeg` ya en repo]**
-> *Insertar las dos imágenes en miniatura una al lado de otra.*
+<img width="3024" height="4032" alt="Image" src="https://github.com/user-attachments/assets/06732109-5336-4288-9f8a-d21efd4000fc" />
 
 ---
 
@@ -121,7 +120,7 @@ pip install -r requirements.txt   # ultralytics, djitellopy, fastapi,
 
 <video src="https://github.com/user-attachments/assets/c7073b3f-b14c-4fbe-8f60-f0d0c85bda01" controls width="500"></video>
 
-### 3. Lanzar
+### 3. Run
 ```
 python main.py
 ```
@@ -131,15 +130,15 @@ La consola web queda accesible en `http://localhost:8000` (`http://0.0.0.0:8000`
 ---
 
 ## Arquitectura
-
+Descargar diagrama de flujo para verlo con más claridad.
 ![Diagrama de flujo](./Diagrama%20de%20flujo.png)
 
-### Módulos (paquete `interceptor/`)
+### `interceptor/`
 
 | Archivo                | Función                                                                                                          |
 | ---------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `tello_interceptor.py` | Orquestador. Posee el `Tello`, el `_sdk_lock` y todos los threads                                                |
-| `constants.py`         | **Única fuente** de constantes: ganancias, límites, gates, umbrales                                              |
+| `tello_interceptor.py` | Orquestador. Posee el objeto dron, el `_sdk_lock` y todos los threads                                                |
+| `constants.py`         | **Única fuente** de constantes: ganancias, límites, umbrales                                              |
 | `perception.py`        | YOLOv8-pose → `list[Person]` con bbox (bounding box, caja de detección) + keypoints (nariz, ojos, orejas, hombros) |
 | `target.py`            | `Target` ( visibilidad + extractor de punto + closeness) + `LockState`                                           |
 | `reid.py`              | `ReidEmbedder` (OSNet x0_25 / MSMT17) permite lockear e identificar correctamente diferentes personas             |
@@ -159,16 +158,13 @@ Cada frame del stream:
 4. **Selección del objetivo activo** (`select_target_person`):
    - **Sin lock** → persona con bbox mayor
    - **Con lock** → diferencia mínima frente al embedding lockeado. Si pasa de `LOCK_MATCH_THRESHOLD = 0.30` se considera pérdida.
-1. **Suavizado EMA** sobre la posición del punto (`alpha = 0.3`, ~5 frames) y sobre el closeness (mismo alpha). Quita el jitter.
+1. **Suavizado EMA** sobre la posición del punto (`alpha = 0.3` y sobre el closeness (mismo alpha). Quita el jitter.
 2. **Histéresis de detección** (`TRACKING_MISS_HYSTERESIS_FRAMES = 45`) — caídas momentáneas de confianza no inician la búsqueda.
-
-> 🎥 **[Demo: detección + keypoints]**
-> *Clip mostrando bbox + esqueleto + crosshair sobre el operador moviéndose.*
 ---
 
 ## Multi-target lock (ReID)
 
-Cuando hay **varias personas** en el frame, el dron debe perseguir a una concreta y no saltar de una a otra. Solución: identidad por **embedding facial-corporal**.
+Cuando hay **varias personas** en el frame, el dron debe perseguir a una concreta y no saltar de una a otra. Solución: pytorchreid
 
 - Modelo: **OSNet x0_25** entrenado en **MSMT17** (`models/osnet_x0_25_msmt17.pt`).
 - Cada detección se convierte en un vector 512-D unitario.
@@ -184,10 +180,6 @@ Cuando hay **varias personas** en el frame, el dron debe perseguir a una concret
 | Tecla `I` / botón "Lock"   | Objetivo sin seleccionar→ hace lock en el bbox más grande. Objetivo lockeado → cicla  entre detecciones de izquierda a derecha |
 | Click sobre el vídeo (web) | Bloquea sobre la persona cuyo bbox contiene el punto cliqueado                                                                 |
 | Tecla `C` / botón "Clear"  | Libera el lock → vuelve a "bbox más grande"                                                                                    |
-
-> 🎥 **[Demo crítica: lock multi-target]**
-> *Escena con 2–3 personas. Mostrar (a) click-to-lock sobre una, (b) las otras se cruzan delante, (c) el dron sigue a la persona correcta. Esta es la feature estrella de la rama `develop-multiple-targets`.*
-
 ---
 
 ## Sistema de objetivos
@@ -208,15 +200,11 @@ Cada `Target` aporta:
 - `closeness(person)` y `closeness_setpoint` — usados por el **PID de pitch en modo bbox** cuando el ToF frontal no es válido.
 
 El target es **intercambiable en runtime** desde la consola web (dropdown `target_name`). Al cambiar se resetean integrales y EMAs para no propagar estados de un target a otro.
-
-> 🎥 **[Demo: cambio de target]**
-> *Cambiar `shoulders_midpoint` → `nose` desde la web y observar cómo el dron se eleva para reencuadrar.*
-
 ---
 
 ## Control PID (4 ejes)
 
-Cuatro lazos PID corren en paralelo a **20 Hz** (`RC_LOOP_INTERVAL_S = 0.05 s`):
+Cuatro bucles PID corren en paralelo a **20 Hz** (`RC_LOOP_INTERVAL_S = 0.05 s`):
 
 | Eje | Variable controlada | Error | Ganancias `(Kp, Ki, Kd)` | Salida |
 |---|---|---|---|---|
@@ -238,7 +226,6 @@ Cuatro lazos PID corren en paralelo a **20 Hz** (`RC_LOOP_INTERVAL_S = 0.05 s`):
 ## Máquina de estados del vuelo
 
 El video loop selecciona un modo cada tick según `is_airborne`, `tracking_target`, y el grace timer:
-
 ```
             ┌─────────┐  takeoff (SPACE)   ┌──────────────┐
             │ grounded│ ──────────────────▶│ intercepting │◀──┐
@@ -306,13 +293,9 @@ Antes de cada envío de RC se aplican gates **acumulables**:
 2. **Wall-stop** — si `front_tof_cm ≤ FRONT_TOF_WALL_STOP_CM` (60 cm) y `fb > 0`, fuerza `fb = 0` y resetea integrales de pitch.
 3. **Mitigación de pared diagonal** — al detectar transición `front_tof_cm: válido → −1` se congela `fb` durante `FRONT_TOF_DISCONTINUITY_FREEZE_S = 0.5 s`.
 4. **Modo phantom** — desactiva por completo el envío de comandos al hardware (sólo HUD).
-
-> 🎥 **[Demo: wall-stop]**
-> *Dron avanzando hacia una pared, ToF frontal disparándose a 60 cm, parada en seco visible en el HUD.*
-
 ---
 
-## Consola Web (FastAPI)
+## WebApp (**Claude Code for backend & claude.ai/design for frontend)
 Servidor FastAPI lanzado en thread daemon al arrancar `main.py`.
 
 ### Endpoints
@@ -340,8 +323,7 @@ Servidor FastAPI lanzado en thread daemon al arrancar `main.py`.
 ---
 
 ## HUD OpenCV
-
-La ventana local (`cv2.imshow("TelloInterceptor")`) muestra el frame anotado con:
+La ventana local (`cv2.imshow("TelloInterceptor")`) muestra el frame con:
 
 - Bboxes + keypoints de todas las detecciones.
 - Highlight diferenciado para el objetivo seleccionado y para "objetivo bloqueado por ReID".
@@ -349,10 +331,6 @@ La ventana local (`cv2.imshow("TelloInterceptor")`) muestra el frame anotado con
 - Tira de telemetría: batería, altitudes, ToFs, ángulos, RC actual.
 - Badges: `PHANTOM` (si activo), modo de control (`AUTO`/`MANUAL` + valores actuales), warning de pared.
 - Etiqueta de estado de detección (target visible, modo actual, nombre del target).
-
-> 🎥 **[Demo: HUD en vivo]**
-> *Captura de pantalla o clip corto del HUD mostrando todos los overlays simultáneamente.*
-
 ---
 
 ## Modo Phantom
@@ -416,6 +394,7 @@ proyecto-drones-tello/
 - **ToF frontal** con muy poco alcance
 - **YOLOv8s-pose @ 960 × 720** corre ~30 FPS en GPU dedicada (no se ha probado en CPU).
 ---
+
 ## Licencia y créditos
 
 Proyecto de Drones
