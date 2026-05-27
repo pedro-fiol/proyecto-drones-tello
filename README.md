@@ -132,6 +132,8 @@ La consola web queda accesible en `http://localhost:8000` (`http://0.0.0.0:8000`
 
 ## Arquitectura
 
+![Diagrama de flujo](./Diagrama%20de%20flujo.png)
+
 ### Módulos (paquete `interceptor/`)
 
 | Archivo                | Función                                                                                                          |
