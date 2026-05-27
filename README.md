@@ -6,58 +6,53 @@ El dron detecta personas con el modelo YOLOv8-pose, selecciona un objetivo (por 
 
 ## DEMO PRINCIPAL
 
-Cada escena se ha grabado con **tres POVs simultáneos**:
+Cada escena grabada desde dos POVs (tres en la escena 6):
 - **POV 1: Portátil** estación de tierra, runea el código y controla el dron desde la WebApp
 - **POV 2: Webapp iPad**, también permite controlar el dron en tiempo real y monitorizar el dron en remoto sin ejecutar ningún código
-- **POV 3: Móvil externo**
+- **POV 3: Móvil externo** (solo escena 6)
 
 ### 1. Controles manuales
 <table>
-<tr><th>Portátil</th><th>iPad</th><th>Móvil externo</th></tr>
+<tr><th>Portátil</th><th>iPad</th></tr>
 <tr>
 <td><video src="https://github.com/user-attachments/assets/dcaff114-b546-4b66-bd4d-f9c0170b454b" controls width="300"></video></td>
 <td><video src="https://github.com/user-attachments/assets/998097cf-5cf3-4b5f-b736-208a38d8c1c2" controls width="300"></video></td>
-<td><em>pendiente</em></td>
 </tr>
 </table>
 
 ### 2. Tracking sin lock
 <table>
-<tr><th>Portátil</th><th>iPad</th><th>Móvil externo</th></tr>
+<tr><th>Portátil</th><th>iPad</th></tr>
 <tr>
 <td><video src="https://github.com/user-attachments/assets/9bc79b9b-f7f4-4f5a-9d46-3064b3951138" controls width="300"></video></td>
 <td><video src="https://github.com/user-attachments/assets/c1d5d563-abe1-4d67-bd7c-b2c5c40aacf2" controls width="300"></video></td>
-<td><em>pendiente</em></td>
 </tr>
 </table>
 
 ### 3. Multi-target + switch de lock
 <table>
-<tr><th>Portátil</th><th>iPad</th><th>Móvil externo</th></tr>
+<tr><th>Portátil</th><th>iPad</th></tr>
 <tr>
 <td><video src="https://github.com/user-attachments/assets/3dd110c2-425e-4096-b6c3-3d81dfee0ad7" controls width="300"></video></td>
 <td><video src="https://github.com/user-attachments/assets/85f9ec4a-b941-4864-b7c9-f29d37014223" controls width="300"></video></td>
-<td><em>pendiente</em></td>
 </tr>
 </table>
 
 ### 4. Interceptación sólo del objetivo bloqueado
 <table>
-<tr><th>Portátil</th><th>iPad</th><th>Móvil externo</th></tr>
+<tr><th>Portátil</th><th>iPad</th></tr>
 <tr>
 <td><video src="https://github.com/user-attachments/assets/2cf82ba8-78bc-4570-9986-69288b476530" controls width="300"></video></td>
 <td><video src="https://github.com/user-attachments/assets/1015982a-7b4c-464e-940a-2d44f96eed9f" controls width="300"></video></td>
-<td><em>pendiente</em></td>
 </tr>
 </table>
 
 ### 5. Búsqueda dirigida al lock
 <table>
-<tr><th>Portátil</th><th>iPad</th><th>Móvil externo</th></tr>
+<tr><th>Portátil</th><th>iPad</th></tr>
 <tr>
 <td><video src="https://github.com/user-attachments/assets/bdff4def-3ad4-4c2a-bc73-3526338fc634" controls width="300"></video></td>
 <td><video src="https://github.com/user-attachments/assets/001994fd-829a-4275-8aa2-e48aa4ed3da4" controls width="300"></video></td>
-<td><em>pendiente</em></td>
 </tr>
 </table>
 
