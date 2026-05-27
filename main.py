@@ -11,7 +11,7 @@ import traceback
 
 
 
-# PHANTOM = True → drone never takes off, all logic dry-runs in HUD. Use for testing PID + YOLO.
+# PHANTOM = True → drone never takes off, all logic in HUD. Use for testing PID + YOLO.
 PHANTOM = False
 
 def main():

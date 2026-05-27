@@ -9,9 +9,7 @@ FRAME_HEIGHT_PIXELS  = 720
 FRAME_CENTER_X       = FRAME_WIDTH_PIXELS  // 2   # 480
 FRAME_CENTER_Y       = FRAME_HEIGHT_PIXELS // 2   # 360
 
-# EMA smoothing on tracked target pixel before PID. YOLO keypoints jitter ±5px @ 30Hz.
-# Without smoothing, derivative term spikes ±12 → noisy ud → rotor pitch coupling → drift.
-# alpha = new-sample weight. 0.3 = stronger smoothing (~5-frame time constant) to tame Kp=0.35.
+# ---- EMA smoothing ----
 TARGET_EMA_ALPHA = 0.3
 
 
@@ -41,15 +39,13 @@ TARGET_ALTITUDE_CM       = 150
 MAX_TRACKING_ALTITUDE_CM = 180   # ceiling clamp 
 MIN_TRACKING_ALTITUDE_CM = 30   # floor clamp 
 
-TARGET_LOST_GRACE_S = 4.0 # to avoid altitude PID flickering; longer = more time yawing toward last-seen side before full search FSM
+TARGET_LOST_GRACE_S = 4.0 # to avoid altitude PID flickering; longer = more time yawing toward last-seen side before full search 
 
 INTERCEPT_DISTANCE_CM       = 95
 FRONT_TOF_MAX_RANGE_CM      = 120
 FRONT_TOF_WALL_STOP_CM      = 60
 
-# Diagonal-wall mitigation: when front ToF goes from valid reading → -1 (OOR) in one
-# poll, drone likely just crossed past a wall edge (narrow ToF cone now looking past wall).
-# Freeze forward motion this many seconds to avoid crashing into the wall diagonally.
+# Diagonal-wall safety: when front ToF goes from valid reading to -1 
 FRONT_TOF_DISCONTINUITY_FREEZE_S = 0.5
 
 # Pitch source hysteresis: stay in ToF mode for N consecutive invalid frames before
@@ -63,8 +59,7 @@ TRACKING_MISS_HYSTERESIS_FRAMES = 45
 
 
 # --- Search algorithm ---
-# Tello has no reliable XY odometry → no dead-reckoning. Advance ends via pitch_pid
-# settling on INTERCEPT_DISTANCE_CM. Budget tracked in cycles, not cm.
+# Tello has no reliable dead reckoning
 SEARCH_SPIN_VELOCITY_DEG_S    = 50
 SEARCH_YAW_TOLERANCE_DEG      = 5
 SEARCH_SAMPLE_EVERY_DEG       = 10       # min yaw delta between direction samples during spin
@@ -76,7 +71,7 @@ SEARCH_OPEN_SPACE_VELOCITY_CM_S = 30     # fb when ToF out-of-range during advan
 # Limits diagonal-wall crash damage range — drone never blindly pushes more than this without re-scanning.
 SEARCH_ADVANCE_MAX_DISTANCE_CM = 100
 
-# Mid-advance yaw sweep: every N seconds during advance, pause fb and do a ±arc sweep
+# Mid-advance yaw sweep: every N seconds during advance, pause fb and do a sweep
 # scanning for off-axis walls. If ToF acquires anything <= SWEEP_WALL_CM, abort advance → re-spin.
 SEARCH_ADVANCE_SWEEP_EVERY_S    = 2.0
 SEARCH_ADVANCE_SWEEP_YAW_DEG_S  = 50    # yaw rate during sweep (gentler than spin)

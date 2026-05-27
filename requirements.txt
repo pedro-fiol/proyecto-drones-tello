@@ -1,0 +1,33 @@
+# Tello Interceptor — runtime dependencies
+# Python 3.12 recommended. PyTorch CUDA 12.1 wheels.
+# Install:
+#   python -m venv .venv
+#   .venv\Scripts\activate
+#   pip install -r requirements.txt
+
+# --- Drone SDK ---
+djitellopy==2.5.0
+
+# --- Computer vision ---
+opencv-python==4.13.0.92
+numpy==2.4.3
+av==17.0.1                          # PyAV — H.264 frame decode
+
+# --- Deep learning (CUDA 12.1) ---
+# If CPU-only or different CUDA version, replace torch/torchvision with:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1+cu121
+torchvision==0.20.1+cu121
+
+# --- Perception models ---
+ultralytics==8.4.41                 # YOLOv8s-pose
+torchreid==0.2.5                    # OSNet ReID embedder
+gdown==6.0.0                        # torchreid weight downloader
+
+# --- Web dashboard (FastAPI + WebSockets) ---
+fastapi==0.136.1
+uvicorn==0.47.0
+websockets==16.0
+httptools==0.7.1
+watchfiles==1.2.0

@@ -1,4 +1,3 @@
-import csv
 import ctypes
 import ctypes.wintypes
 import os
@@ -177,13 +176,6 @@ class TelloInterceptor:
         self.pitch_bbox_pid = PIDController(*GAINS_FORWARD_BACK_BBOX_PID, output_min=-FB_MAX_VELOCITY_CM_S, output_max=FB_MAX_VELOCITY_CM_S)
         self.roll_pid = PIDController(*GAINS_LEFT_RIGHT_PID, output_min=-LR_MAX_VELOCITY_CM_S, output_max=LR_MAX_VELOCITY_CM_S)
         self.rc = [0, 0, 0, 0]  # left right, forward backward, up down, yaw
-
-        # logging for PID tunning
-        self._altitude_log: list[tuple] = []
-        self._yaw_log: list[tuple] = []
-        self._pitch_log: list[tuple] = []
-        self._roll_log: list[tuple] = []
-        self._log_start_time: float = 0.0
 
         # last time the active target was visible
         # Used to avoid switching to searching mode (no target detected) due to detection jitter
@@ -455,8 +447,6 @@ class TelloInterceptor:
             #     print(f"[ERROR] Auto-takeoff failed: {e}")
             #     self._is_airborne = False
 
-        self._log_start_time = time.time()
-
         self.video_active = True
         self.front_tof_active   = True
         self.telemetry_active   = True
@@ -472,7 +462,7 @@ class TelloInterceptor:
 
 
     """
-    Stops all threads and lands drone. Saves logs.
+    Stops all threads and lands drone.
     """
     def stop(self):
         if self._stop_finished:
@@ -486,24 +476,6 @@ class TelloInterceptor:
         self.telemetry_active = False
 
         time.sleep(1.5)  # > EXT tof? timeout (1s) so ToF thread fully exits
-
-        # Save logs BEFORE drone shutdown — if save raises, drone cleanup must still run
-        try:
-            self._save_altitude_log()
-        except Exception as e:
-            print(f"[WARN] altitude log save failed: {e}")
-        try:
-            self._save_yaw_log()
-        except Exception as e:
-            print(f"[WARN] yaw log save failed: {e}")
-        try:
-            self._save_pitch_log()
-        except Exception as e:
-            print(f"[WARN] pitch log save failed: {e}")
-        try:
-            self._save_roll_log()
-        except Exception as e:
-            print(f"[WARN] roll log save failed: {e}")
 
         if not self.phantom_mode and self._is_airborne:
             print("[INFO] Initiating auto-landing on shutdown...")
@@ -525,88 +497,6 @@ class TelloInterceptor:
             pass
         finally:
             self._stop_finished = True
-
-
-    def _save_csv_safe(self, path: str, header: list, rows: list) -> None:
-        os.makedirs("logs", exist_ok=True)
-        try:
-            with open(path, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(header)
-                writer.writerows(rows)
-            print(f"[INFO] Log saved → {path}")
-        except PermissionError:
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            base, ext = os.path.splitext(path)
-            fallback = f"{base}_{ts}{ext}"
-            with open(fallback, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(header)
-                writer.writerows(rows)
-            print(f"[WARN] {path} locked → saved to {fallback}")
-
-
-    def _save_yaw_log(self) -> None:
-        if not self._yaw_log:
-            return
-        self._save_csv_safe(
-            "logs/yaw_response.csv",
-            ["time_s", "target_x", "error_x_pixels", "yaw_command"],
-            self._yaw_log,
-        )
-
-
-    def _save_pitch_log(self) -> None:
-        """Write pitch PID log to logs/pitch_response.csv.
-
-        Columns:
-            time_s              — seconds since takeoff
-            front_tof_cm        — raw front ToF reading (-1 = invalid)
-            closeness           — tracked person closeness signal from active TARGET (-1 = no person)
-            error               — PID error in active source units (cm for tof, closeness units for bbox)
-            fb_command          — commanded fb velocity (cm/s) sent to RC
-            source              — "tof" | "bbox" | "none"
-        """
-        if not self._pitch_log:
-            return
-        self._save_csv_safe(
-            "logs/pitch_response.csv",
-            ["time_s", "front_tof_cm", "closeness", "error", "fb_command", "source"],
-            self._pitch_log,
-        )
-
-
-    def _save_roll_log(self) -> None:
-        """Write roll PID log to logs/roll_response.csv.
-
-        Columns:
-            time_s         — seconds since takeoff
-            target_x       — EMA-smoothed target x px (-1 = not tracking)
-            bbox_left      — bbox left edge px (-1 = not tracking)
-            bbox_right     — bbox right edge px (-1 = not tracking)
-            error_roll     — px (target_x - frame_center_x), 0 when inside bbox dead-zone
-            lr_command     — commanded lr velocity (cm/s)
-            inside_bbox    — 1 if target centered horizontally on drone (dead-zone), else 0
-        """
-        if not self._roll_log:
-            return
-        self._save_csv_safe(
-            "logs/roll_response.csv",
-            ["time_s", "target_x", "bbox_left", "bbox_right", "error_roll", "lr_command", "inside_bbox"],
-            self._roll_log,
-        )
-
-
-    def _save_altitude_log(self) -> None:
-        """Write altitude PID log to logs/altitude_response.csv."""
-        if not self._altitude_log:
-            return
-        self._save_csv_safe(
-            "logs/altitude_response.csv",
-            ["time_s", "height_cm", "error", "ud_command", "mode"],
-            self._altitude_log,
-        )
-
 
 
     """
@@ -676,27 +566,27 @@ class TelloInterceptor:
             if frame_count % YOLO_FRAME_STRIDE == 0:
                 detected_persons = self.person_detector.detect_persons_in_frame(current_frame)
 
-            # ---- Multi-target lock pipeline ----
-            # 1) Embed every detection (one batched forward pass on the ReID model).
-            #    Cheap on CUDA (~3 ms / person for OSNet x0_25). Skipped when the
-            #    embedder failed to init or no detections this frame.
-            # 2) Apply any pending lock intents from keyboard / webapp (I, C, click)
-            #    so the lock state reflects the operator's latest action BEFORE
-            #    selection — no one-frame delay between click and visible lock.
-            # 3) select_target_person picks the chosen person via cosine distance
-            #    when locked, or biggest-bbox / nearest-to-last when unlocked.
-            # 4) On a successful match, EMA-blend the new embedding into the lock
-            #    so slow appearance drift (pose, lighting) doesn't break identity.
 
+
+
+            """
+            Multi-target lock:
+                1) Embed every detection with ReID model OSnetx0.25
+                2) Apply lock status for every frame
+                3) select_target_person picks the chosen person when locked, or biggest-bbox / nearest-to-last when unlocked.
+                4) If successful aply EMA smoothing to avoid ReID flickering
+            """
+
+            # Extract person crops from the frame
             embeddings = None
             if self.reid is not None and detected_persons:
                 crops = [
                     crop_bbox(current_frame, p.x1, p.y1, p.x2, p.y2)
                     for p in detected_persons
                 ]
-                # Filter out None crops while keeping index alignment with detected_persons.
-                # crop_bbox returns None only for degenerate bboxes (zero area after clamp).
-                # If any crop is None, fall back to no-embedding for safety.
+   
+                # check all crops are valid 
+                # if detection box is None skip embedding to avoid ReID errors
                 if all(c is not None for c in crops):
                     try:
                         embeddings = self.reid.embed_batch(crops)
@@ -837,10 +727,8 @@ class TelloInterceptor:
             """
             valid_front_tof = self.front_tof_cm > 0
 
-            # default pitch logging fields (filled per branch)
+            # pitch source latched across frames for D-term seeding on transitions
             pitch_source = "none"
-            closeness_value = -1.0
-
 
             # Each mode of the drone will compute the velocity commands this is just for safety
             lr = 0
@@ -848,11 +736,7 @@ class TelloInterceptor:
             ud = 0
             yaw = 0
 
-            # roll log defaults (filled in tracking branch)
-            roll_bbox_left = -1.0
-            roll_bbox_right = -1.0
             error_roll = 0.0
-            roll_inside_bbox = 0
 
             # Grounded -> skip autonomous FSM. No PID, no search spin. RC stays 0.
             # Phantom mode dry-runs the FSM, so don't gate on airborne there.
@@ -926,10 +810,6 @@ class TelloInterceptor:
                         self._bbox_width_smoothed = (TARGET_EMA_ALPHA * raw_width +
                                                     (1.0 - TARGET_EMA_ALPHA) * self._bbox_width_smoothed)
 
-                # Expose smoothed closeness for logging regardless of pitch source
-                if self._closeness_ema_initialized:
-                    closeness_value = self._closeness_smoothed
-
                 # --- Target Altitude PID ---
                 # All errors use convention: error = target - measurement, then adjust gains sign accordingly
                 error_altitude = self._target_smoothed_y_px - target_setpoint_y_px
@@ -985,18 +865,14 @@ class TelloInterceptor:
                 bbox_half = self._bbox_width_smoothed / 2
                 bbox_left  = self._bbox_center_x_smoothed - bbox_half
                 bbox_right = self._bbox_center_x_smoothed + bbox_half
-                roll_bbox_left = bbox_left
-                roll_bbox_right = bbox_right
 
                 if bbox_left <= frame_center_x <= bbox_right:
                     lr = 0
                     error_roll = 0.0
-                    roll_inside_bbox = 1
                     self.roll_pid.reset_integral()
                 else:
                     error_roll = self._target_smoothed_x_px - frame_center_x
                     lr = self.roll_pid.compute(error_roll, RC_LOOP_INTERVAL_S)
-                    roll_inside_bbox = 0
 
 
             # target not visible but seen recently -> grace period, hover instead of searching
@@ -1184,41 +1060,6 @@ class TelloInterceptor:
 
             # for debug
             #print(self.rc[1], self.front_tof_cm)
-            
-
-            self._altitude_log.append((
-                time.time() - self._log_start_time,
-                self.height_cm,
-                error_altitude,
-                ud,
-                mode_label,
-            ))
-
-            self._yaw_log.append((
-                time.time() - self._log_start_time,
-                self._target_smoothed_x_px if tracking_target else -1,
-                error_yaw if tracking_target or mode_label == "hover" else 0.0,
-                yaw,
-            ))
-
-            self._pitch_log.append((
-                time.time() - self._log_start_time,
-                self.front_tof_cm,
-                closeness_value,
-                error_pitch,
-                fb,
-                pitch_source,
-            ))
-
-            self._roll_log.append((
-                time.time() - self._log_start_time,
-                self._target_smoothed_x_px if tracking_target else -1,
-                roll_bbox_left,
-                roll_bbox_right,
-                error_roll,
-                lr,
-                roll_inside_bbox,
-            ))
 
             # Latch pitch source for next-frame transition detection (D-term seeding).
             self._pitch_source_last = pitch_source

@@ -445,6 +445,23 @@ Thumbs.db
 # Claude / session files
 CLAUDE.md
 SESSION-*.md
+.claude/
+.agents/
+skills-lock.json
 
 # Test scripts
 test_front_ToF
+
+# Logs and tuning artefacts
+logs/
+Altitude_PID/
+Altitude_Face_PID/
+Pitch_PID/
+Yaw_PID/
+PID_tunning/
+
+# Personal notes / exports
+md_exports/
+video_plan.md
+flux_diagram.md
+steps.pdf
