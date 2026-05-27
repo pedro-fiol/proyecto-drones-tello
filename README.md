@@ -15,8 +15,8 @@ Cada escena se ha grabado con **tres POVs simultáneos**:
 <table>
 <tr><th>Portátil</th><th>iPad</th><th>Móvil externo</th></tr>
 <tr>
-<td><video src="media/01_manual_laptop.mp4" controls width="300"></video></td>
-<td><video src="media/01_manual_ipad.MOV" controls width="300"></video></td>
+<td><video src="https://github.com/user-attachments/assets/dcaff114-b546-4b66-bd4d-f9c0170b454b" controls width="300"></video></td>
+<td><video src="https://github.com/user-attachments/assets/998097cf-5cf3-4b5f-b736-208a38d8c1c2" controls width="300"></video></td>
 <td><em>pendiente</em></td>
 </tr>
 </table>
@@ -25,8 +25,8 @@ Cada escena se ha grabado con **tres POVs simultáneos**:
 <table>
 <tr><th>Portátil</th><th>iPad</th><th>Móvil externo</th></tr>
 <tr>
-<td><em>pendiente</em></td>
-<td><video src="media/02_nolock_ipad.mp4" controls width="300"></video></td>
+<td><video src="https://github.com/user-attachments/assets/9bc79b9b-f7f4-4f5a-9d46-3064b3951138" controls width="300"></video></td>
+<td><video src="https://github.com/user-attachments/assets/c1d5d563-abe1-4d67-bd7c-b2c5c40aacf2" controls width="300"></video></td>
 <td><em>pendiente</em></td>
 </tr>
 </table>
@@ -35,8 +35,8 @@ Cada escena se ha grabado con **tres POVs simultáneos**:
 <table>
 <tr><th>Portátil</th><th>iPad</th><th>Móvil externo</th></tr>
 <tr>
-<td><em>pendiente</em></td>
-<td><video src="media/03_switch_ipad.MOV" controls width="300"></video></td>
+<td><video src="https://github.com/user-attachments/assets/3dd110c2-425e-4096-b6c3-3d81dfee0ad7" controls width="300"></video></td>
+<td><video src="https://github.com/user-attachments/assets/85f9ec4a-b941-4864-b7c9-f29d37014223" controls width="300"></video></td>
 <td><em>pendiente</em></td>
 </tr>
 </table>
@@ -45,8 +45,8 @@ Cada escena se ha grabado con **tres POVs simultáneos**:
 <table>
 <tr><th>Portátil</th><th>iPad</th><th>Móvil externo</th></tr>
 <tr>
-<td><em>pendiente</em></td>
-<td><video src="media/04_lock_only_ipad.MOV" controls width="300"></video></td>
+<td><video src="https://github.com/user-attachments/assets/2cf82ba8-78bc-4570-9986-69288b476530" controls width="300"></video></td>
+<td><video src="https://github.com/user-attachments/assets/1015982a-7b4c-464e-940a-2d44f96eed9f" controls width="300"></video></td>
 <td><em>pendiente</em></td>
 </tr>
 </table>
@@ -55,8 +55,8 @@ Cada escena se ha grabado con **tres POVs simultáneos**:
 <table>
 <tr><th>Portátil</th><th>iPad</th><th>Móvil externo</th></tr>
 <tr>
-<td><em>pendiente</em></td>
-<td><video src="media/05_searchlock_ipad.mp4" controls width="300"></video></td>
+<td><video src="https://github.com/user-attachments/assets/bdff4def-3ad4-4c2a-bc73-3526338fc634" controls width="300"></video></td>
+<td><video src="https://github.com/user-attachments/assets/001994fd-829a-4275-8aa2-e48aa4ed3da4" controls width="300"></video></td>
 <td><em>pendiente</em></td>
 </tr>
 </table>
@@ -65,9 +65,9 @@ Cada escena se ha grabado con **tres POVs simultáneos**:
 <table>
 <tr><th>Portátil</th><th>iPad</th><th>Móvil externo</th></tr>
 <tr>
-<td><em>pendiente</em></td>
-<td><video src="media/06_searchfsm_ipad.mp4" controls width="300"></video></td>
-<td><em>pendiente</em></td>
+<td><video src="https://github.com/user-attachments/assets/30dc0bb2-eb0c-4e20-be47-3ffd23140413" controls width="300"></video></td>
+<td><video src="https://github.com/user-attachments/assets/617b5047-7af9-4382-a5ea-ef0b23bdc02d" controls width="300"></video></td>
+<td><video src="https://github.com/user-attachments/assets/0f5a8ebf-1da0-4083-80f6-d3999bfc441a" controls width="300"></video></td>
 </tr>
 </table>
 
@@ -123,7 +123,9 @@ pip install -r requirements.txt   # ultralytics, djitellopy, fastapi,
 - Colocar el kit de expansión al dron y encenderlo
 - Con un dispositivo móvil que permita compartir datos mediante cable conectarlo al portátil estación de tierra, debería mostrar una conexión LAN al hotspot del dispositivo móvil
 - Conectarse mediante WiFi al Tello
-PEGAR FOTO SETUP MONTADO
+
+<video src="https://github.com/user-attachments/assets/c7073b3f-b14c-4fbe-8f60-f0d0c85bda01" controls width="500"></video>
+
 ### 3. Lanzar
 ```
 python main.py
