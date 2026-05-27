@@ -465,3 +465,6 @@ md_exports/
 video_plan.md
 flux_diagram.md
 steps.pdf
+
+# Local-only media (videos served via GitHub user-attachments CDN in README)
+media/
