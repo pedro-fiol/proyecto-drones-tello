@@ -1,175 +1,402 @@
 # Tello Interceptor
 
-Autonomous person-tracking drone built on a **DJI RoboMaster Tello Talent (RMTT)**.
-The drone searches an indoor space, locks onto the first person it sees, follows them, and intercepts them at a configurable distance — using only the onboard camera, the front-facing ToF expansion sensor, and a Wi-Fi link to a PC running PyTorch + CUDA.
+Dron autónomo de **persecución e interceptación de personas en interiores** usando un **DJI RoboMaster Tello Talent (RMTT)**.
 
-> 4th-year **Drone Programming** project — Universitat Politècnica de Catalunya (UPC), course 2025–2026.
+El dron detecta personas con el modelo YOLOv8-pose, selecciona un objetivo (por identidad ReID o por la caja de detección más grande), y lo persigue controladores PID para altitud, yaw, roll y pitch. Cuando pierde al objetivo entra en un algoritmo de búsqueda (spin + advance + sweep) hasta reencontrarlo. Toda la operación se monitoriza en tiempo real desde una WebApp que hace de dashboard (FastAPI + WebSocket) y que también permite tomar control manual.
+
+## DEMO PRINCIPAL
+
+Cada escena se ha grabado con **tres POVs simultáneos**:
+- **POV 1: Portátil** estación de tierra, runea el código y controla el dron desde la WebApp
+- **POV 2: Webapp iPad**, también permite controlar el dron en tiempo real y monitorizar el dron en remoto sin ejecutar ningún código
+- **POV 3: Móvil externo**
+
+### 1. Controles manuales
+|                                 | iPad                          | Móvil externo                  |
+| ------------------------------- | ----------------------------- | ------------------------------ |
+| ![](media/01_manual_laptop.mp4) | ![](media/01_manual_ipad.mp4) | ![](media/01_manual_phone.mp4) |
+
+### 2. Tracking sin lock
+| Portátil                        | iPad                          | Móvil externo                  |
+| ------------------------------- | ----------------------------- | ------------------------------ |
+| ![](media/02_nolock_laptop.mp4) | ![](media/02_nolock_ipad.mp4) | ![](media/02_nolock_phone.mp4) |
+
+### 3. Multi-target + switch de lock
+| Portátil                        | iPad                          | Móvil externo                  |
+| ------------------------------- | ----------------------------- | ------------------------------ |
+| ![](media/03_switch_laptop.mp4) | ![](media/03_switch_ipad.mp4) | ![](media/03_switch_phone.mp4) |
+
+### 4. Interceptación sólo del objetivo bloqueado
+| Portátil                          | iPad                            | Móvil externo                    |
+| --------------------------------- | ------------------------------- | -------------------------------- |
+| ![](media/04_lockonly_laptop.mp4) | ![](media/04_lockonly_ipad.mp4) | ![](media/04_lockonly_phone.mp4) |
+
+### 5. Búsqueda dirigida al lock
+| Portátil                            | iPad                              | Móvil externo                      |
+| ----------------------------------- | --------------------------------- | ---------------------------------- |
+| ![](media/05_searchlock_laptop.mp4) | ![](media/05_searchlock_ipad.mp4) | ![](media/05_searchlock_phone.mp4) |
+
+### 6. Demo del algoritmo de búsqueda completo
+| Portátil                           | iPad                             | Móvil externo                     |
+| ---------------------------------- | -------------------------------- | --------------------------------- |
+| ![](media/06_searchfsm_laptop.mp4) | ![](media/06_searchfsm_ipad.mp4) | ![](media/06_searchfsm_phone.mp4) |
 
 ---
 
-## Demo videos
+## Índice
 
-<!-- Drag-and-drop your .mp4 demos into a GitHub issue/PR, copy the generated
-     `https://github.com/user-attachments/...` URL, and paste it below as the
-     image source. GitHub will render an inline player. -->
-
-| Search → Lock → Track | Multi-target switching | Web dashboard |
-| :---: | :---: | :---: |
-| _video placeholder_ | _video placeholder_ | _video placeholder_ |
-
----
-
-## What it does
-
-1. **Searches** — when no target is visible, spins on the spot, then advances into open space (front ToF clear) and sweeps.
-2. **Detects** — YOLOv8s-pose runs every frame at 30 Hz, returning bounding boxes + 17 COCO keypoints per person.
-3. **Locks** — extracts an **OSNet ReID embedding** of the chosen person and tracks that embedding across frames, so a different person walking through the view does not steal the lock.
-4. **Tracks** — four independent PID loops drive yaw, altitude, pitch (front-back) and roll (left-right) to keep the target centred and at a fixed distance.
-5. **Intercepts** — closes in until the front ToF reads ≤ `INTERCEPT_DISTANCE_CM`, then holds station.
-6. **Stops safely** — geofence ceiling/floor clamps, front-ToF wall stop, and a diagonal-wall discontinuity freeze prevent the drone from punching through walls.
-
-The operator can override anything at any time via keyboard or the web dashboard.
+1. [Hardware](#hardware)
+2. [Instalación rápida](#instalación-rápida)
+3. [Arquitectura](#arquitectura)
+4. [Detección](#detección)
+5. [Multi-target lock (ReID)](#multi-target-lock-reid)
+6. [Sistema de objetivos](#sistema-de-objetivos)
+7. [Control PID (4 ejes)](#control-pid-4-ejes)
+8. [Máquina de estados del vuelo](#máquina-de-estados-del-vuelo)
+9. [Algoritmo de búsqueda](#algoritmo-de-búsqueda)
+10. [Capas de seguridad](#capas-de-seguridad)
+11. [Consola Web (FastAPI)](#consola-web-fastapi)
+12. [HUD OpenCV](#hud-opencv)
+13. [Modo Phantom](#modo-phantom)
+14. [Atajos de teclado](#atajos-de-teclado)
+15. [Estructura del repositorio](#estructura-del-repositorio)
+16. [Limitaciones conocidas](#limitaciones-conocidas)
 
 ---
 
 ## Hardware
 
-| Component | Notes |
-| --- | --- |
-| **DJI RoboMaster Tello Talent (RMTT)** | SSID `RMTT-AD3294`, AP IP `192.168.10.1`. Used via `djitellopy` SDK. |
-| **RmTTOC ESP32 expansion kit** | Provides the front-facing **VL53Lx ToF** (range ≤ 120 cm) used for intercept distance and wall avoidance. Read via `EXT tof?` SDK command. |
-| **PC running PyTorch + CUDA** | Tested on Python 3.12 + CUDA 12.1. Wi-Fi to the drone AP is required during flight (see `switch-tello.ps1`). |
+| Componente       | Detalle                                                           |
+| ---------------- | ----------------------------------------------------------------- |
+| Dron             | DJI RoboMaster Tello Talent (RMTT), SSID `RMTT-AD3294`            |
+| Kit de expansión | RmTTOC ESP32                                                      |
+| IP del dron      | `192.168.10.1`                                                    |
+| Stream de vídeo  | 960 × 720 @ ~30 FPS                                               |
+| Sensores propios | Barómetro, ToF inferior, IMU (pitch / roll / yaw / aceleraciones) |
+| Sensor añadido   | ToF frontal vía `EXT tof?` del kit de expansión                   |
+
+> 📷 **[Foto del dron equipado — `fototello1.jpeg` / `fototello2.jpeg` ya en repo]**
+> *Insertar las dos imágenes en miniatura una al lado de otra.*
 
 ---
 
-## Architecture
+## Instalación rápida
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  main.py                                                        │
-│    └── TelloInterceptor  (orchestrator, owns Tello + threads)   │
-│         ├── video_loop   ─────► perception ─► targets ─► PIDs   │
-│         ├── rc_control_loop @ 20 Hz  ─────►  Tello SDK          │
-│         └── front_tof_loop                                      │
-│                                                                 │
-│  webapp/server.py                                               │
-│    └── FastAPI + WebSocket dashboard (telemetry + dpad control) │
-└─────────────────────────────────────────────────────────────────┘
-```
+> Requisitos: Windows, Portátil con GPU y tarjeta WiFi que acepte se pueda conectar a redes 5G, **Python 3.12** (CUDA-enabled PyTorch), adaptador WiFi externo o iPhone con que comparta datos con cable al portátil , todos los dispositivos que se conecten a la conexión compartida del iPhone podrán acceder a la WebApp. No lo he probado con Android pero seguro que hay un equivalente a la aplicación "Dispositivos Apple" que permite compartir datos mediante cable y nos ahorra la necesidad de tener que tener un adaptador WiFi externo.
 
-Module map (`interceptor/`):
-
-| File | Responsibility |
-| --- | --- |
-| `tello_interceptor.py` | Orchestrator. Owns the Tello, the SDK lock and the worker threads. |
-| `perception.py` | YOLOv8s-pose → `list[Person]` (bbox + 17 keypoints + visibility). |
-| `target.py` | The four selectable targets: `face`, `eyes`, `shoulders`, `bbox`. Each carries its own visibility rule and point extractor. Also holds the ReID `LockState`. |
-| `reid.py` | OSNet embedder + cosine matching + EMA smoothing of the locked embedding. |
-| `pid_controller.py` | Reusable PID with output clamping and integral reset. |
-| `hud_overlay.py` | All OpenCV drawing — crosshair, bbox, target dot, badges, telemetry strip. |
-| `constants.py` | Every tunable value (gains, thresholds, distances) with units in the name. **Edit here, nowhere else.** |
-
----
-
-## Quick start
-
-### 1. Wi-Fi switch (Windows, run as admin)
-
+### 1. Instalar dependencias
 ```powershell
-powershell -ExecutionPolicy Bypass -File switch-tello.ps1 tello
+pip install -r requirements.txt   # ultralytics, djitellopy, fastapi,
+                                  # uvicorn, torchreid, opencv-python, ...
 ```
-Connects the PC to `RMTT-AD3294`. Use `lan` at the end of the session to switch back.
+### 2. Setup previo
+- Colocar el kit de expansión al dron y encenderlo
+- Con un dispositivo móvil que permita compartir datos mediante cable conectarlo al portátil estación de tierra, debería mostrar una conexión LAN al hotspot del dispositivo móvil
+- Conectarse mediante WiFi al Tello
+PEGAR FOTO SETUP MONTADO
+### 3. Lanzar
+```
+python main.py
+```
+La consola web queda accesible en `http://localhost:8000` (`http://0.0.0.0:8000`)
+(o la IP del PC en la LAN para acceder desde un cualquier dispositivo conectado al hotspot).
 
-### 2. Install
+---
 
-```powershell
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
+## Arquitectura
+
+### Módulos (paquete `interceptor/`)
+
+| Archivo                | Función                                                                                                          |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `tello_interceptor.py` | Orquestador. Posee el `Tello`, el `_sdk_lock` y todos los threads                                                |
+| `constants.py`         | **Única fuente** de constantes: ganancias, límites, gates, umbrales                                              |
+| `perception.py`        | YOLOv8-pose → `list[Person]` con bbox (bounding box, caja de detección) + keypoints (nariz, ojos, orejas, hombros) |
+| `target.py`            | `Target` ( visibilidad + extractor de punto + closeness) + `LockState`                                           |
+| `reid.py`              | `ReidEmbedder` (OSNet x0_25 / MSMT17) permite lockear e identificar correctamente diferentes personas             |
+| `pid_controller.py`    | Controlador PID                                                                                                  |
+| `hud_overlay.py`       | Dibujado sobre el frame: bboxes, keypoints, crosshair, telemetría, badges                                        |
+WebApp:
+- `webapp/server.py`: servidor FastAPI (HTTP + WebSocket + MJPEG)
+- `webapp/static/index.html`: dashboard (video + dpad + lock + telemetría)
+---
+## Detección
+
+Cada frame del stream:
+
+1. **YOLO** (`yolov8s-pose.pt`, conf ≥ 0.8, clase `person`) → lista de `Person`.
+2. Cada `Person` lleva bbox + 7 keypoints COCO seleccionados (nariz, ojos, orejas, hombros).
+3. **Embedding ReID** opcional: si `models/osnet_x0_25_msmt17.pt` está disponible, cada bbox se recorta y se pasa por OSNet.
+4. **Selección del objetivo activo** (`select_target_person`):
+   - **Sin lock** → persona con bbox mayor
+   - **Con lock** → diferencia mínima frente al embedding lockeado. Si pasa de `LOCK_MATCH_THRESHOLD = 0.30` se considera pérdida.
+1. **Suavizado EMA** sobre la posición del punto (`alpha = 0.3`, ~5 frames) y sobre el closeness (mismo alpha). Quita el jitter.
+2. **Histéresis de detección** (`TRACKING_MISS_HYSTERESIS_FRAMES = 45`) — caídas momentáneas de confianza no inician la búsqueda.
+
+> 🎥 **[Demo: detección + keypoints]**
+> *Clip mostrando bbox + esqueleto + crosshair sobre el operador moviéndose.*
+---
+
+## Multi-target lock (ReID)
+
+Cuando hay **varias personas** en el frame, el dron debe perseguir a una concreta y no saltar de una a otra. Solución: identidad por **embedding facial-corporal**.
+
+- Modelo: **OSNet x0_25** entrenado en **MSMT17** (`models/osnet_x0_25_msmt17.pt`).
+- Cada detección se convierte en un vector 512-D unitario.
+- `LockState.embedding` guarda la huella del objetivo escogido.
+- En cada frame: `dist = 1 − cos(embedding_lock, embedding_i)`. La detección con menor distancia que pase el umbral es el objetivo.
+- **Suavizante EMA del embedding** (`alpha = 0.05`) evita perder un lockeo fácilmente 
+- Si ninguna detección pasa el umbral → entra en `hover` (grace 4 s) → `searching`.
+
+**Tres formas de adquirir el lock:**
+
+| Acción                     | Resultado                                                                                                                      |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Tecla `I` / botón "Lock"   | Objetivo sin seleccionar→ hace lock en el bbox más grande. Objetivo lockeado → cicla  entre detecciones de izquierda a derecha |
+| Click sobre el vídeo (web) | Bloquea sobre la persona cuyo bbox contiene el punto cliqueado                                                                 |
+| Tecla `C` / botón "Clear"  | Libera el lock → vuelve a "bbox más grande"                                                                                    |
+
+> 🎥 **[Demo crítica: lock multi-target]**
+> *Escena con 2–3 personas. Mostrar (a) click-to-lock sobre una, (b) las otras se cruzan delante, (c) el dron sigue a la persona correcta. Esta es la feature estrella de la rama `develop-multiple-targets`.*
+
+---
+
+## Sistema de objetivos
+
+`Target` es un clase que describe **qué punto del cuerpo sigue el dron y dónde lo encuadra**. Cuatro vienen predefinidos:
+
+| Target                         | Punto seguido             | Encuadre Y  | Señal de cercanía          | Setpoint |
+| ------------------------------ | ------------------------- | ----------- | -------------------------- | -------- |
+| `nose`                         | Centro de la nariz        | 0.20 (alto) | bbox height / frame height | 0.7      |
+| `eyes_midpoint`                | Punto medio de ambos ojos | 0.20        | bbox height / frame height | 0.7      |
+| `shoulders_midpoint` (default) | Centro de los hombros     | 0.25        | bbox width / frame width   | 0.45     |
+| `bbox_center`                  | Centro del bbox completo  | 0.50        | bbox height / frame height | 0.7      |
+
+Cada `Target` aporta:
+
+- `is_visible(person)`: gate de keypoints requeridos.
+- `point(person)`: devuelve `(x, y)` que alimenta los PID de yaw / altitud / roll.
+- `closeness(person)` y `closeness_setpoint` — usados por el **PID de pitch en modo bbox** cuando el ToF frontal no es válido.
+
+El target es **intercambiable en runtime** desde la consola web (dropdown `target_name`). Al cambiar se resetean integrales y EMAs para no propagar estados de un target a otro.
+
+> 🎥 **[Demo: cambio de target]**
+> *Cambiar `shoulders_midpoint` → `nose` desde la web y observar cómo el dron se eleva para reencuadrar.*
+
+---
+
+## Control PID (4 ejes)
+
+Cuatro lazos PID corren en paralelo a **20 Hz** (`RC_LOOP_INTERVAL_S = 0.05 s`):
+
+| Eje | Variable controlada | Error | Ganancias `(Kp, Ki, Kd)` | Salida |
+|---|---|---|---|---|
+| **Altitud (baro)** | `height_cm` | `target_alt − height_cm` (cm) | `(1.4, 0.04, 0.08)` | `ud` cm/s (clamp ±60) |
+| **Altitud (target)** | `target_y_px` | `target_y_smoothed − y_setpoint` (px) | `(−0.15, −0.004, −0.08)` | `ud` cm/s (clamp ±60) |
+| **Yaw** | `target_x_px` | `target_x_smoothed − frame_center_x` (px) | `(0.2, 0.003, 0.1)` | `yaw` deg/s (clamp ±50) |
+| **Pitch (ToF)** | distancia frontal | `intercept_dist − front_tof_cm` (cm) | `(−0.85, −0.02, −0.42)` | `fb` cm/s (clamp ±100) |
+| **Pitch (bbox)** | closeness | `setpoint − closeness_smoothed` | `(200, 0, 20)` | `fb` cm/s (clamp ±100) |
+| **Roll** | `target_x_px` (fuera de bbox) | `target_x − frame_center_x` (px) | `(0.2, 0.01, 0.15)` | `lr` cm/s (clamp ±60) |
+
+**Convención de signo del error**: la altitud usa `target − medida` (imagen-y invertida vs. mundo arriba), el yaw usa `medida − target`. Es **intencional** — no unificar sin verificar ambos ejes a la vez.
+
+**Detalles importantes del bucle:**
+
+- **Anti-windup** por saturación + reset explícito (`reset_integral()`) al cambiar de modo, target o tipo de fuente de pitch.
+- **Hand-off ToF ↔ bbox** en el eje de pitch: histéresis `FRONT_TOF_INVALID_HYSTERESIS_FRAMES = 3` evita parpadeo en el borde de los 120 cm. Al cambiar de fuente, el `error_last` del PID entrante se siembra con el error actual para que el término D no salte en la primera muestra (las unidades cambian de cm a ratio).
+- **Roll con dead-zone de bbox**: si el centro horizontal de la imagen cae dentro del bbox suavizado del objetivo, `lr = 0`. Evita oscilaciones laterales innecesarias cuando el target ya está "delante".
+---
+## Máquina de estados del vuelo
+
+El video loop selecciona un modo cada tick según `is_airborne`, `tracking_target`, y el grace timer:
+
+```
+            ┌─────────┐  takeoff (SPACE)   ┌──────────────┐
+            │ grounded│ ──────────────────▶│ intercepting │◀──┐
+            └─────────┘                    └──────┬───────┘   │
+                  ▲                               │           │ target
+                  │ land (SPACE)                  │ target    │ reacquired
+                  │                               │ lost      │
+                  │                          ┌────▼─────┐     │
+                  │                          │  hover   │─────┘
+                  │                          └────┬─────┘
+                  │                               │ > TARGET_LOST_GRACE_S (4 s)
+                  │                          ┌────▼─────┐
+                  │                          │searching │ ── algoritmo de búsqueda
+                  │                          └──────────┘
+                  │
+                  └── manual (M) ◀──▶ cualquier modo (override de RC)
 ```
 
-> The ReID weights (`models/osnet_x0_25_msmt17.pt`, 9 MB) ship with the repo so the drone is ready to fly without an extra download.
+- **grounded** — sin RC, todos los integrales en cero.
+- **intercepting** — todos los PID activos (altitud-target, yaw, pitch, roll).
+- **hover** — `ud = 0` (Tello mantiene con baro + optical-flow). El yaw apunta hacia el último lado conocido si el target se perdió por borde.
+- **searching** — altitud-baro activa, algoritmo de búsqueda controla yaw/fb.
+- **manual** — `lr/fb/ud/yaw` provienen del teclado o del dpad web (con heartbeat 0.6 s).
 
-### 3. Run
+---
 
-```powershell
-.venv\Scripts\python.exe main.py
+## Algoritmo de búsqueda
+
+Cuando el grace de 4 s expira sin reencontrar al objetivo, el dron entra en `searching`. 
+
+```
+        ┌─────────┐
+   ──▶  │  spin   │  yawea a SEARCH_SPIN_VELOCITY_DEG_S (50°/s)
+        └────┬────┘  hacia el último lado conocido del target.
+             │       Acumula ángulo hasta 360° → garantiza barrido completo.
+             │
+             ▼
+        ┌─────────┐  PID de pitch sobre ToF frontal con setpoint
+   ┌──▶ │ advance │  INTERCEPT_DISTANCE_CM (95 cm). Si ToF = OOR
+   │    │ moving  │  empuja a SEARCH_OPEN_SPACE_VELOCITY_CM_S.
+   │    └────┬────┘
+   │         │ cada SEARCH_ADVANCE_SWEEP_EVERY_S (2 s)
+   │         ▼
+   │    ┌─────────┐  fb = 0, yaw ± SWEEP_ARC_DEG (20°). Si durante el
+   │    │ advance │  barrido ToF lee ≤ 80 cm → muro en diagonal,
+   │    │ sweeping│  aborta el advance y vuelve a spin.
+   │    └────┬────┘
+   │         │
+   └─────────┘  Bucle hasta:
+                · ToF | error | < 15 cm (objetivo a distancia de interceptación)
+                · timeout 8 s
+                · distancia integrada > 100 cm (cap por seguridad)
+                → vuelve a spin
 ```
 
-A live OpenCV window opens with the HUD. The FastAPI dashboard auto-starts on `http://localhost:8000` — open it on a phone on the same Wi-Fi to control the drone from a touch device.
-
-> Set `PHANTOM = True` in `main.py` to run the full perception + control stack **without taking off** — useful for testing PIDs, perception, and HUD on the desk.
+Si en cualquier momento se reencuentra al objetivo (`tracking_target == True`), el algoritmo de búsqueda se resetea y se vuelve a `intercepting`.
 
 ---
 
-## Controls
+## Capas de seguridad
 
-### Keyboard (operator at the PC)
+Antes de cada envío de RC se aplican gates **acumulables**:
 
-| Key | Action |
-| --- | --- |
-| `Space` | Takeoff / land |
-| `M` | Toggle manual mode |
-| `W` / `S` | Forward / backward |
-| `A` / `D` | Strafe left / right |
-| `Q` / `E` | Yaw left / right |
-| `↑` / `↓` | Up / down |
-| `I` | Lock onto the closest centred person (ReID) |
-| `C` | Clear the current lock |
-| `Esc` | Emergency stop |
+1. **Geofence vertical** — bloquea `ud > 0` si `height_cm ≥ MAX_TRACKING_ALTITUDE_CM` (180 cm) y `ud < 0` si `≤ MIN_TRACKING_ALTITUDE_CM` (30 cm).
+2. **Wall-stop** — si `front_tof_cm ≤ FRONT_TOF_WALL_STOP_CM` (60 cm) y `fb > 0`, fuerza `fb = 0` y resetea integrales de pitch.
+3. **Mitigación de pared diagonal** — al detectar transición `front_tof_cm: válido → −1` se congela `fb` durante `FRONT_TOF_DISCONTINUITY_FREEZE_S = 0.5 s`.
+4. **Modo phantom** — desactiva por completo el envío de comandos al hardware (sólo HUD).
 
-### Web dashboard
-
-- Touch dpad for manual control (lr/fb, ud/yaw).
-- Tap a person in the video feed to lock onto them.
-- Buttons for takeoff/land, toggle manual, lock/clear, stop, and target-mode switch (face / eyes / shoulders / bbox).
+> 🎥 **[Demo: wall-stop]**
+> *Dron avanzando hacia una pared, ToF frontal disparándose a 60 cm, parada en seco visible en el HUD.*
 
 ---
 
-## Features
+## Consola Web (FastAPI)
+Servidor FastAPI lanzado en thread daemon al arrancar `main.py`.
 
-- **YOLOv8s-pose perception** — 30 Hz, 17 COCO keypoints, runs on CUDA.
-- **Four target modes** — `face`, `eyes`, `shoulders`, `bbox`. Each has its own visibility rule, so the controller falls back gracefully when keypoints disappear.
-- **OSNet ReID lock** — once locked, the same person stays tracked even if another walks through the frame. EMA-smoothed embeddings + cosine distance threshold.
-- **Four independent PIDs** —
-  - **Yaw**: nose-x error → yaw rate (gains `0.25 / 0.001 / 0.05`)
-  - **Altitude**: target-y / baro → ud (gains `2.0 / 0.05 / 0.2`)
-  - **Pitch**: ToF distance + bbox-width fallback → fb
-  - **Roll**: target-x error inside bbox dead-zone → lr
-- **Search FSM** — spins in place, then advances into open ToF space, then sweeps. Hysteresis on detection loss avoids flicker.
-- **Safety stack** — geofence ceiling/floor, front-ToF wall stop, diagonal-wall discontinuity freeze, manual override with priority, web heartbeat watchdog.
-- **Web dashboard** — FastAPI + WebSocket, live MJPEG feed, dpad control, target selector. Same intent flags as the keyboard — no duplicated logic.
+### Endpoints
 
----
+| Ruta | Tipo | Función |
+|---|---|---|
+| `GET /` | HTTP | `static/index.html` |
+| `GET /video` | MJPEG | Stream multipart del frame anotado (JPEG q=80, ~30 FPS) |
+| `WS /ws/telemetry` | WebSocket | Push 20 Hz de todo el estado (RC, sensores, modo, lock, target) |
+| `POST /cmd/takeoff_land` | HTTP | Toggle takeoff / land (equiv. SPACE) |
+| `POST /cmd/toggle_manual` | HTTP | Entra / sale de manual (equiv. M) |
+| `POST /cmd/lock` | HTTP | Lock-cycle (equiv. I) |
+| `POST /cmd/clear_lock` | HTTP | Liberar lock (equiv. C) |
+| `POST /cmd/lock_at` | HTTP | Click-to-lock con coords normalizadas `{x, y}` ∈ [0, 1] |
+| `POST /cmd/set_target` | HTTP | Cambiar target activo (`{name: "nose"|...}`) |
+| `POST /cmd/manual_set` | HTTP | Velocidades manuales `{lr, fb, ud, yaw}` (heartbeat) |
+| `POST /cmd/stop` | HTTP | Apagado limpio (equiv. ESC) |
 
-## Tech stack
+### Diseño
 
-- **Python 3.12**
-- **PyTorch 2.5.1 + CUDA 12.1** — perception inference
-- **Ultralytics YOLOv8s-pose** — detection + keypoints
-- **torchreid (OSNet x0.25, MSMT17)** — re-identification embeddings
-- **djitellopy** — Tello SDK wrapper (video + commands)
-- **OpenCV** — frame decode helpers + HUD rendering
-- **PyAV** — H.264 stream decode
-- **FastAPI + Uvicorn + WebSockets** — web dashboard
-- **NumPy** — math + image arrays
+- **Sin auth, sin HTTPS** — pensado para `localhost` o LAN sobre el AP del dron. Si se expone a WAN, añadir tunelado y token.
+- **Heartbeat manual**: cada `/cmd/manual_set` empuja `_web_manual_until` 0.6 s hacia el futuro. El frontend reenvía cada ~100 ms mientras se pulse un botón del dpad. Pestaña muerta → heartbeat vence → drone para.
+- **Telemetría completa** vía WS: `mode, is_airborne, is_manual, battery, front_tof, down_tof, height, pitch, roll, yaw, vx/vy/vz, ax/ay/az, temp, rc[4], locked_track_id, lock_distance, lock_target_idx, num_detections, reid_available, search_state, target_name, available_targets`.
 
 ---
 
-## Repository contents
+## HUD OpenCV
 
-| Path | Purpose |
-| --- | --- |
-| `main.py` | Entry point. |
-| `interceptor/` | Core control + perception package. |
-| `webapp/` | FastAPI dashboard + static frontend. |
-| `models/osnet_x0_25_msmt17.pt` | Vendored ReID weights. |
-| `switch-tello.ps1` | Wi-Fi auto-switch helper (admin). |
-| `requirements.txt` | Pinned runtime dependencies. |
-| `Tello_Interceptor_-_Defensa.pptx` | Project defense slides. |
+La ventana local (`cv2.imshow("TelloInterceptor")`) muestra el frame anotado con:
+
+- Bboxes + keypoints de todas las detecciones.
+- Highlight diferenciado para el objetivo seleccionado y para "objetivo bloqueado por ReID".
+- Crosshair central, línea horizontal del setpoint Y del target activo.
+- Tira de telemetría: batería, altitudes, ToFs, ángulos, RC actual.
+- Badges: `PHANTOM` (si activo), modo de control (`AUTO`/`MANUAL` + valores actuales), warning de pared.
+- Etiqueta de estado de detección (target visible, modo actual, nombre del target).
+
+> 🎥 **[Demo: HUD en vivo]**
+> *Captura de pantalla o clip corto del HUD mostrando todos los overlays simultáneamente.*
 
 ---
 
-## License & credits
+## Modo Phantom
 
-Academic project, UPC Aerospace Engineering 4A — Drone Programming course, 2025/2026.
+Editar `main.py` y poner `PHANTOM = True`:
+
+```python
+PHANTOM = True
+```
+
+- El dron **nunca despega** (`takeoff()` skip).
+- El RC loop no envía nada al hardware.
+- Toda la lógica corre: detección, PID, algoritmo de búsqueda, HUD, web.
+
+Ideal para tunear ganancias y depurar sin batería ni espacio físico.
+
+---
+## Atajos de teclado
+
+| Tecla | Acción |
+|---|---|
+| `SPACE` | Takeoff / land toggle |
+| `M` | Entrar / salir de modo manual |
+| `W / S / A / D` | Forward / back / left / right (manual) |
+| `Q / E` | Yaw izquierda / derecha (manual) |
+| `↑ / ↓` | Subir / bajar (manual) |
+| `I` | Lock-cycle (bbox más grande → ciclar entre detecciones) |
+| `C` | Liberar lock |
+| `ESC` | Apagado limpio (guarda logs + lands) |
+
+---
+
+## Estructura del repositorio
+
+```
+proyecto-drones-tello/
+├── main.py                    # entry point
+├── interceptor/
+│   ├── tello_interceptor.py   # orquestador + threads
+│   ├── constants.py           # única fuente de constantes
+│   ├── perception.py          # YOLOv8-pose → Person
+│   ├── target.py              # Target + LockState + selección
+│   ├── reid.py                # OSNet embedder
+│   ├── pid_controller.py      # PID genérico
+│   └── hud_overlay.py         # dibujado sobre frame
+├── webapp/
+│   ├── server.py              # FastAPI + WS + MJPEG
+│   └── static/index.html      # consola operador
+├── models/
+│   └── osnet_x0_25_msmt17.pt  # ReID (vendored)
+├── yolov8s-pose.pt            # detector + pose (raíz)
+├── requirements.txt
+└── Tello_Interceptor_-_Defensa.pptx
+```
+
+---
+
+## Limitaciones conocidas
+
+- Dead-reckoning no fiable en el Tello, geofence horizontal no se ha implementado
+- **ToF frontal** con muy poco alcance
+- **YOLOv8s-pose @ 960 × 720** corre ~30 FPS en GPU dedicada (no se ha probado en CPU).
+---
+## Licencia y créditos
+
+Proyecto de Drones
+Mayo 2026
+Pedro Fiol Benites (`Aszent47`).
+
+Modelos pre-entrenados:
+- YOLOv8s-pose — Ultralytics.
+- OSNet x0_25 / MSMT17 — KaiyangZhou/deep-person-reid.
+
+Librerías: `djitellopy`, `ultralytics`, `torchreid`, `fastapi`, `uvicorn`, `opencv-python`, `pytorch`
+
+WebApp: Claude.
