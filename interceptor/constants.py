@@ -152,7 +152,7 @@ LOCK_EMBEDDING_EMA_ALPHA   = 0.05
 # SHOULDER_WIDTH_RATIO_SETPOINT — kept for reference / fallback.
 #
 # The active TARGET selection lives in interceptor/target.py to avoid circular imports.
-BBOX_HEIGHT_RATIO_SETPOINT     = 1
+BBOX_HEIGHT_RATIO_SETPOINT     = 0.7
 BBOX_WIDTH_RATIO_SETPOINT      = 0.45
 SHOULDER_WIDTH_RATIO_SETPOINT  = 0.35
 

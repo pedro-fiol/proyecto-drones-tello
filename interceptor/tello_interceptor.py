@@ -416,7 +416,7 @@ class TelloInterceptor:
         if last_exc is not None:
             raise RuntimeError(
                 "Tello connect failed after 3 attempts. "
-                "Check WiFi is on the Tello AP (run switch-tello.ps1 tello)."
+                "Check WiFi is connected to the Tello AP (RMTT-AD3294)."
             ) from last_exc
         print(f"[INFO] Connected. Battery: {self.tello.get_battery()}%")
 

@@ -5,12 +5,6 @@ from interceptor.tello_interceptor import TelloInterceptor
 from webapp.server import start_in_thread
 import traceback
 
-# powershell -ExecutionPolicy Bypass -File switch-tello.ps1 tello
-# powershell -ExecutionPolicy Bypass -File switch-tello.ps1 dual
-# powershell -ExecutionPolicy Bypass -File switch-tello.ps1 lan
-
-
-
 # PHANTOM = True → drone never takes off, all logic in HUD. Use for testing PID + YOLO.
 PHANTOM = False
 
