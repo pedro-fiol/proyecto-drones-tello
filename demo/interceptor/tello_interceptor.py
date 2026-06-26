@@ -267,6 +267,12 @@ class TelloInterceptor:
         """Clear identity lock — same effect as pressing C."""
         self._ui_clear_lock_pending = True
 
+    def lock_at(self, x_norm: float, y_norm: float) -> None:
+        """Lock the person under a tap on the video. x, y normalized 0..1."""
+        x = max(0.0, min(1.0, float(x_norm)))
+        y = max(0.0, min(1.0, float(y_norm)))
+        self._lock_pending_at = (x, y)
+
     def set_device(self, device: str) -> bool:
         """Ask for a cuda/cpu swap (done next video tick). False if invalid or no cuda."""
         device = device.lower()

@@ -139,8 +139,10 @@ class DemoDashboard(tk.Tk):
         self._manual_tick()
 
     def _build_video(self):
-        self.video = tk.Canvas(self, bg=VIDEO_BG, highlightthickness=0, bd=0)
+        self.video = tk.Canvas(self, bg=VIDEO_BG, highlightthickness=0, bd=0, cursor="crosshair")
         self.video.pack(side="left", fill="both", expand=True)
+        self.video.bind("<Button-1>", self._on_video_click)
+        self._img_rect = None   # (left, top, w, h) of the drawn frame, for click mapping
         self._msg = self.video.create_text(10, 10, text="Conectando con el dron...",
                                            anchor="center", fill=INK4, font=(FONT, 24, "bold"))
 
@@ -216,6 +218,23 @@ class DemoDashboard(tk.Tk):
         target = "cpu" if self.device_current == "cuda" else "cuda"
         self.drone.set_device(target)
 
+    def _on_video_click(self, event):
+        # tap a person on the video to lock onto them
+        n = self._click_to_norm(event.x, event.y)
+        if n is not None:
+            self.drone.lock_at(n[0], n[1])
+
+    def _click_to_norm(self, x, y):
+        # canvas pixel -> 0..1 inside the drawn frame (None if outside / no frame)
+        rect = self._img_rect
+        if not rect:
+            return None
+        left, top, w, h = rect
+        ix, iy = x - left, y - top
+        if w <= 0 or h <= 0 or ix < 0 or iy < 0 or ix > w or iy > h:
+            return None
+        return ix / w, iy / h
+
     def _toggle_fullscreen(self, _event=None):
         self.attributes("-fullscreen", not self.attributes("-fullscreen"))
 
@@ -228,6 +247,7 @@ class DemoDashboard(tk.Tk):
         if frame is None:
             self.video.itemconfig(self._msg, state="normal")
             self.video.coords(self._msg, cw / 2, ch / 2)
+            self._img_rect = None
         else:
             self.video.itemconfig(self._msg, state="hidden")
             scale = min(cw / FRAME_W, ch / FRAME_H)
@@ -242,6 +262,7 @@ class DemoDashboard(tk.Tk):
             else:
                 self.video.coords(self._video_item, cw / 2, ch / 2)
                 self.video.itemconfig(self._video_item, image=self._photo)
+            self._img_rect = ((cw - new_w) / 2, (ch - new_h) / 2, new_w, new_h)
         self.after(VIDEO_REFRESH_MS, self._update_video)
 
     def _poll_telemetry(self):

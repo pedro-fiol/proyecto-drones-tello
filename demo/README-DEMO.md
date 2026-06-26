@@ -29,6 +29,8 @@ Uses the main project's `.venv` (CUDA PyTorch) — nothing to install. The
 | **MODO MANUAL** | Toggle manual flight (lights amber when active) |
 | **GPU / CPU** | Switch inference between CUDA GPU and CPU (chip above the buttons). Greyed to `CPU (sin GPU)` when no CUDA device is present. |
 
+**Tap a person on the video** to lock onto them — the most reliable way to pick or switch target. `SEGUIR OBJETIVO` locks the biggest person; `CAMBIAR OBJETIVO` cycles to the next.
+
 Joysticks (active only in manual mode):
 - **Left** — ↕ thrust, ↔ yaw
 - **Right** — ↕ pitch, ↔ roll
