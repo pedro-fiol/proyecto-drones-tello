@@ -42,6 +42,7 @@ def draw_person_overlays(
     target: "Target",
     chosen_idx: Optional[int] = None,
     locked: bool = False,
+    person_ids: "Optional[list[Optional[int]]]" = None,
 ) -> tuple:
     """
     Draw bbox + label + target dot for every detected person.
@@ -60,6 +61,7 @@ def draw_person_overlays(
         - locked: True when LockState.is_locked. Changes the chosen bbox to the
             yellow LOCK palette so the operator sees the lock is engaged
             even between matches.
+        - person_ids: gallery number per detection (Person N -> "P N"), None = not in gallery.
 
     Returns (target_x, target_y, tracking, tracked_person):
         - target_x, target_y pixel coords of the active target point on the
@@ -77,15 +79,17 @@ def draw_person_overlays(
 
     for idx, person in enumerate(persons):
         is_chosen = (chosen_idx is not None and idx == chosen_idx)
+        person_id = person_ids[idx] if person_ids is not None and idx < len(person_ids) else None
+        id_tag = f"P{person_id}" if person_id is not None else "P?"
 
         if is_chosen:
             if locked:
                 color = COLOR_LOCKED_BOX
                 thickness = 3
                 if target.is_visible(person):
-                    label = f"LOCK {target.name.upper()} {person.bbox_confidence:.2f}"
+                    label = f"{id_tag} LOCK {target.name.upper()} {person.bbox_confidence:.2f}"
                 else:
-                    label = f"LOCK BACK {person.bbox_confidence:.2f}"
+                    label = f"{id_tag} LOCK BACK {person.bbox_confidence:.2f}"
             else:
                 if target.is_visible(person):
                     color = COLOR_FACE_BOX
@@ -103,7 +107,7 @@ def draw_person_overlays(
         else:
             color = COLOR_DECOY_BOX
             thickness = 1
-            label = f"P{idx} {person.bbox_confidence:.2f}"
+            label = f"{id_tag} {person.bbox_confidence:.2f}"
 
         cv2.rectangle(frame, (person.x1, person.y1), (person.x2, person.y2), color, thickness)
 

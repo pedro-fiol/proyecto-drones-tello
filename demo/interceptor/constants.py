@@ -126,6 +126,44 @@ LOCK_MATCH_THRESHOLD       = 0.30
 LOCK_EMBEDDING_EMA_ALPHA   = 0.05
 
 
+# ---- Takeoff scan + person gallery ----
+# After takeoff the drone yaws one full turn and saves every person it sees into the gallery,
+# then picks one at random and chases it.
+# Privacy: the gallery keeps only ReID embeddings + bearing, in RAM. No images.
+# Persons are numbered P1, P2, ... in first-seen order (CW scan -> left to right around the room).
+SCAN_YAW_VELOCITY_DEG_S     = 40      # ~9 s per turn; a person stays ~2 s in the 82° FOV = dozens of frames
+SCAN_TURN_DEG               = 360.0
+SCAN_TIMEOUT_S              = 25.0    # end scan even if IMU yaw never reaches SCAN_TURN_DEG (telemetry dead)
+CAMERA_HORIZONTAL_FOV_DEG   = 82.6    # Tello camera, used to turn bbox x offset into a bearing
+
+# Same-person cosine distance for gallery entries. Same scale as LOCK_MATCH_THRESHOLD.
+GALLERY_MATCH_THRESHOLD     = 0.30
+# Entry counts as a person only after this many sightings (drops one-frame false positives).
+GALLERY_MIN_SIGHTINGS       = 4
+
+# Scan sightings that make bad ReID references are skipped (they split one person into several):
+#   bbox touching the left/right frame edge = half a body entering/leaving the view during the turn
+#   bbox shorter than this share of the frame height = far / tiny person, embedding is noise
+GALLERY_EDGE_MARGIN_RATIO      = 0.03   # of frame width, each side (a cut body touches the edge)
+GALLERY_MIN_BBOX_HEIGHT_RATIO  = 0.20   # of frame height
+
+# Target search: spin in place (SEARCH_SPIN_VELOCITY_DEG_S) until the chosen person is seen.
+# One full turn without a match -> give up on that person, pick another one at random.
+TARGET_SPIN_TURN_DEG        = 360.0
+TARGET_SPIN_TIMEOUT_S       = 20.0    # end the turn even if IMU yaw never reaches TARGET_SPIN_TURN_DEG
+
+
+# ---- Expansion-kit LED matrix (8x8, red/blue/purple) ----
+# Fire-and-forget sends (never wait for the reply -> never block the RC loop).
+# Current icon re-sent this often in case a UDP packet was dropped.
+LED_RESEND_S = 2.0
+
+# ---- Link safety ----
+# Drone state packets or video frames older than this while airborne -> hover (rc 0 0 0 0).
+# rc values persist on the Tello: frozen telemetry would otherwise keep the last climb running.
+LINK_STALE_S = 1.0
+
+
 # ---- Target tracking ----
 # Closeness setpoints used by the pitch fallback PID when front ToF is invalid.
 # Each Target picks one of these via target.closeness_setpoint. Higher closeness =

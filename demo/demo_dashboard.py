@@ -45,8 +45,10 @@ STAT_BIG   = (FONT, 30, "bold")
 LABEL_FONT = (FONT, 11, "bold")
 
 MODE_ES = {
-    "intercepting": "siguiendo", "searching": "buscando", "hover": "esperando",
+    "intercepting": "siguiendo", "searching": "buscando", "hover": "objetivo perdido",
     "grounded": "en suelo", "manual": "manual", "init": "iniciando",
+    "scanning": "escaneando", "waiting": "sin personas",
+    "link_lost": "SEÑAL PERDIDA · en espera",
 }
 
 
@@ -161,6 +163,8 @@ class DemoDashboard(tk.Tk):
             anchor="w", padx=16, pady=(0, 8))
         self.lbl_mode = tk.Label(card, text="MODO  —", bg=SURFACE, fg=INK2, font=STAT_FONT)
         self.lbl_mode.pack(anchor="w", padx=16)
+        self.lbl_target = tk.Label(card, text="OBJETIVO  —", bg=SURFACE, fg=INK2, font=STAT_FONT)
+        self.lbl_target.pack(anchor="w", padx=16)
         self.lbl_people = tk.Label(card, text="PERSONAS  0", bg=SURFACE, fg=INK2, font=STAT_FONT)
         self.lbl_people.pack(anchor="w", padx=16, pady=(0, 12))
 
@@ -177,13 +181,13 @@ class DemoDashboard(tk.Tk):
                                              INK, "#ffffff", "#222222", INK)
         self.btn_takeoff.pack(fill="x", pady=8, **pad)
 
-        self.btn_track = self._make_button(panel, "SEGUIR OBJETIVO", self.drone.track_or_cycle,
-                                           SURFACE2, INK, "#eeeef0", LINE)
-        self.btn_track.pack(fill="x", pady=8, **pad)
-
-        self.btn_switch = self._make_button(panel, "CAMBIAR OBJETIVO", self.drone.track_or_cycle,
+        self.btn_switch = self._make_button(panel, "CAMBIAR OBJETIVO", self.drone.change_target,
                                             SURFACE2, INK, "#eeeef0", LINE)
         self.btn_switch.pack(fill="x", pady=8, **pad)
+
+        self.btn_rescan = self._make_button(panel, "REESCANEAR", self.drone.rescan,
+                                            SURFACE2, INK, "#eeeef0", LINE)
+        self.btn_rescan.pack(fill="x", pady=8, **pad)
 
         self.btn_manual = self._make_button(panel, "MODO MANUAL", self._toggle_manual,
                                             SURFACE2, INK, "#eeeef0", LINE)
@@ -281,8 +285,23 @@ class DemoDashboard(tk.Tk):
             col = CRIT if bat < 20 else WARN if bat < 40 else OK
             self.lbl_battery.config(text=f"{bat} %", fg=col)
         mode = t.get("mode", "—")
-        self.lbl_mode.config(text=f"MODO  {MODE_ES.get(mode, mode)}")
-        self.lbl_people.config(text=f"PERSONAS  {t.get('num_detections', 0)}")
+        mode_text = MODE_ES.get(mode, mode)
+        if mode == "scanning":
+            mode_text += f"  {int(t.get('scan_turned_deg', 0))}° / 360°"
+        elif mode == "searching" and t.get("selected_person_id") is not None:
+            mode_text += f"  {int(t.get('target_spin_turned_deg', 0))}° / 360°"
+        self.lbl_mode.config(text=f"MODO  {mode_text}")
+
+        target_id = t.get("selected_person_id")
+        if target_id is not None and t.get("mission_phase") == "track":
+            # ReID distance to the target in view (match <= lock_threshold). Helps tune thresholds in flight.
+            dist = t.get("lock_distance", -1.0)
+            dist_text = f"  ·  d {dist:.2f}" if isinstance(dist, (int, float)) and dist >= 0 else ""
+            self.lbl_target.config(text=f"OBJETIVO  P{target_id}{dist_text}", fg=INK)
+        else:
+            self.lbl_target.config(text="OBJETIVO  —", fg=INK2)
+        self.lbl_people.config(
+            text=f"PERSONAS  {t.get('gallery_count', 0)} escaneadas · {t.get('num_detections', 0)} en imagen")
 
         if t.get("is_airborne"):
             self.btn_takeoff.config(text="ATERRIZAR", bg=CRIT, fg="#ffffff",

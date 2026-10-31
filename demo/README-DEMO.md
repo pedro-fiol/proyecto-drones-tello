@@ -23,13 +23,47 @@ Uses the main project's `.venv` (CUDA PyTorch) — nothing to install. The
 
 | Button | Action |
 |---|---|
-| **DESPEGAR / ATERRIZAR** | Take off / land (label follows flight state) |
-| **SEGUIR OBJETIVO** | Lock onto the nearest person |
-| **CAMBIAR OBJETIVO** | Cycle the lock to the next person |
+| **DESPEGAR / ATERRIZAR** | Take off / land (label follows flight state). Takeoff starts the 360° scan. |
+| **CAMBIAR OBJETIVO** | Chase another scanned person, picked at random (never the current one) |
+| **REESCANEAR** | Forget everyone, turn 360° again, pick a new random person |
 | **MODO MANUAL** | Toggle manual flight (lights amber when active) |
 | **GPU / CPU** | Switch inference between CUDA GPU and CPU (chip above the buttons). Greyed to `CPU (sin GPU)` when no CUDA device is present. |
 
-**Tap a person on the video** to lock onto them — the most reliable way to pick or switch target. `SEGUIR OBJETIVO` locks the biggest person; `CAMBIAR OBJETIVO` cycles to the next.
+### Target flow
+
+1. **Takeoff → scan.** The drone turns 360° (40°/s, ~9 s) and remembers every person it
+   sees as P1, P2, … in scan order (CW turn = left to right). Only ReID embeddings are
+   kept, in RAM — no photos, nothing written to disk. Half bodies at the frame edge and
+   tiny far-away detections are not used as references; after the turn, entries that
+   turn out to be the same person are merged. Nobody found → the drone scans again.
+2. **Random target.** When the turn ends, the drone picks one scanned person at random and chases it.
+3. **CAMBIAR OBJETIVO.** Picks another scanned person at random, spins in place until it sees
+   that person, then chases it.
+4. **Not found.** If one full spin (360°) does not find the chosen person — or the target is
+   lost during the chase — the drone picks another random person it has not tried yet and
+   spins again. When nobody from the scan is found, it scans the room again.
+
+**Tap a person on the video** to lock onto them directly. The dot-matrix display (RMTT kit)
+shows the state: eye = scanning, crosshair = chasing, `?` = spinning to find the target,
+`M` = manual, pause = no persons found.
+
+The panel line `OBJETIVO P2 · d 0.18` shows the ReID distance to the target in view: a match
+needs `d <= 0.30` (`LOCK_MATCH_THRESHOLD`). Values just above 0.30 while the person is clearly
+in view mean the threshold is too tight for the room's lighting.
+
+**Link safety.** If the drone's video or telemetry stops updating for 1 s while flying (WiFi
+drop), the drone is commanded to hover (`rc 0 0 0 0`) and the panel shows `SEÑAL PERDIDA`.
+Tello keeps flying its last stick values otherwise.
+
+### Checks without flying
+
+- **LED kit:** drone on the ground, PC on its WiFi, then from this folder
+  `..\.venv\Scripts\python.exe led_test.py`. Every `EXT mled` line must answer `mled ok`
+  and the matrix must show the icon. Any other answer = the kit firmware does not run the
+  matrix commands.
+- **Full flow, no drone:** `..\.venv\Scripts\python.exe sim_flow.py` (~2 min). Real YOLO +
+  ReID on sample photos with a fake drone: scan → random target → change → link loss →
+  empty room. Ends with `RESULT ... True` for each phase.
 
 Joysticks (active only in manual mode):
 - **Left** — ↕ thrust, ↔ yaw

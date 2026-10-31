@@ -16,8 +16,13 @@ from .target import (
     select_best_person, select_target_person, set_active_target,
 )
 from .reid import ReidEmbedder, crop_bbox
+from .person_gallery import PersonGallery, bearing_of_person_deg, choose_random_person
+from .led_matrix import LedMatrix
 
 from .constants import (
+    SCAN_YAW_VELOCITY_DEG_S, SCAN_TURN_DEG, SCAN_TIMEOUT_S,
+    GALLERY_EDGE_MARGIN_RATIO, GALLERY_MIN_BBOX_HEIGHT_RATIO,
+    TARGET_SPIN_TURN_DEG, TARGET_SPIN_TIMEOUT_S,
     GAINS_LEFT_RIGHT_PID, LR_MAX_VELOCITY_CM_S,
     SEARCH_SPIN_VELOCITY_DEG_S,
     SEARCH_ADVANCE_TOLERANCE_CM, SEARCH_ADVANCE_TIMEOUT_S,
@@ -37,7 +42,7 @@ from .constants import (
     MANUAL_UD_VELOCITY_CM_S, MANUAL_YAW_VELOCITY_DEG_S,
     MAX_TRACKING_ALTITUDE_CM, MIN_TRACKING_ALTITUDE_CM,
     RC_LOOP_INTERVAL_S, TARGET_ALTITUDE_CM, UD_MAX_VELOCITY_CM_S, YAW_MAX_VELOCITY_CM_S,
-    WEB_MANUAL_HEARTBEAT_GRACE_S,
+    WEB_MANUAL_HEARTBEAT_GRACE_S, LINK_STALE_S,
     YOLO_FRAME_STRIDE,
 )
 
@@ -145,6 +150,36 @@ class TelloInterceptor:
 
         self.lock = LockState()
 
+        # Takeoff scan gallery — RAM only, embeddings + bearing, no images. Mission phase:
+        #   "scan"  — 360° yaw after takeoff, every person seen goes into the gallery
+        #   "wait"  — hover, track nobody (gallery empty after scan)
+        #   "track" — locked on a randomly picked gallery person, intercept/hover/search FSM below
+        self.gallery = PersonGallery()
+        self._mission_phase: str = "scan"
+        self._scan_t0: float = 0.0
+        self._scan_turned_deg: float = 0.0          # CW turn so far (= heading for bearings)
+        self._scan_unwrapped_deg: float = 0.0       # signed IMU yaw change since scan start
+        self._scan_yaw_last_deg: Optional[float] = None
+        self._scan_start_yaw_deg: Optional[float] = None
+        self._selected_person_id: Optional[int] = None
+
+        # Persons spun for and not found since the last successful find. Never picked again this round.
+        self._tried_person_ids: set[int] = set()
+
+        # Target search spin: one full turn in place looking for the locked person.
+        self._target_spin_t0: float = 0.0
+        self._target_spin_turned_deg: float = 0.0
+        self._target_spin_unwrapped_deg: float = 0.0
+        self._target_spin_yaw_last_deg: Optional[float] = None
+
+        # Gallery intents from dashboard / takeoff / land, consumed once per video tick.
+        self._change_target_pending: bool = False
+        self._rescan_pending: bool = False
+
+        self._start_scan()
+
+        self.led_matrix = LedMatrix(self.tello, self._sdk_lock)
+
         # Lock intents, consumed once per video tick.
         #   _at: (x_norm, y_norm) click — lock bbox containing point
         #   _cycle: 'I' key — lock biggest if unlocked, else advance L→R
@@ -228,6 +263,14 @@ class TelloInterceptor:
         self._front_tof_cm_prev: float = -1.0
         self._front_tof_freeze_until: float = 0.0
 
+        # Link safety — last time a NEW state packet / video frame arrived, last video-loop tick.
+        # djitellopy replaces the state dict and the frame array on every packet/frame -> identity = freshness.
+        self._last_state_obj = None
+        self._last_state_time: float = 0.0
+        self._last_raw_frame = None
+        self._last_frame_time: float = 0.0
+        self._video_tick_time: float = 0.0
+
         # Spin angle accumulator — exits at 360° (full camera sweep).
         self._search_spin_angle_deg: float = 0.0
 
@@ -287,6 +330,83 @@ class TelloInterceptor:
     def request_stop(self) -> None:
         """Trigger clean shutdown: same effect as pressing ESC."""
         self.video_active = False
+
+    def change_target(self) -> None:
+        """Chase another scanned person, picked at random (never the current one). Applied next video tick."""
+        self._change_target_pending = True
+
+    def rescan(self) -> None:
+        """Forget everyone, turn 360° again, then pick a new random person."""
+        self._rescan_pending = True
+
+    def _start_scan(self) -> None:
+        """Enter scan phase with fresh turn counters. No ReID -> no gallery possible, go straight to track
+        (unlocked biggest-bbox tracking, behaviour before the gallery existed)."""
+        if self.reid is None:
+            self._mission_phase = "track"
+            return
+        self._mission_phase = "scan"
+        self._scan_t0 = time.time()
+        self._scan_turned_deg = 0.0
+        self._scan_unwrapped_deg = 0.0
+        self._scan_yaw_last_deg = None
+        self._scan_start_yaw_deg = None
+        self._tried_person_ids = set()
+
+    def _reset_tracking_state(self) -> None:
+        """Wipe target PIDs + EMA + loss timers. New target -> no carry-over from the last one."""
+        self.altitude_target_pid.reset_integral()
+        self.yaw_pid.reset_integral()
+        self.pitch_pid.reset_integral()
+        self.pitch_bbox_pid.reset_integral()
+        self.roll_pid.reset_integral()
+        self._target_ema_initialized = False
+        self._closeness_ema_initialized = False
+        self._bbox_ema_initialized = False
+        self._tracking_miss_count = TRACKING_MISS_HYSTERESIS_FRAMES + 1
+        self._last_target_seen_time = 0.0
+        self._search_state = "none"
+
+    def _select_person(self, person_id: int) -> bool:
+        """Lock gallery Person N and chase it at once. Not in view -> search spin finds only this person.
+        Returns False when N is not in the gallery."""
+        selected_embedding = self.gallery.get_embedding(person_id)
+        if selected_embedding is None:
+            return False
+        self.lock.lock_from(selected_embedding.to(self.device))
+        self._selected_person_id = person_id
+        self._mission_phase = "track"
+        self._reset_tracking_state()
+        # Search spin starts toward the person's scan bearing (shortest way round).
+        bearing = self.gallery.get_bearing_deg(person_id)
+        if bearing is not None and self._scan_start_yaw_deg is not None:
+            # IMU yaw sign for a CW turn, as measured during the scan (no convention assumed).
+            imu_sign_cw = 1.0 if self._scan_unwrapped_deg >= 0 else -1.0
+            heading_now_deg = (imu_sign_cw * (self.yaw_deg - self._scan_start_yaw_deg)) % 360.0
+            turn_deg = (bearing - heading_now_deg + 540.0) % 360.0 - 180.0
+            self._last_target_side = 1 if turn_deg >= 0 else -1
+        print(f"[INFO] Target -> P{person_id}")
+        return True
+
+    def _pick_random_target(self, exclude_ids: set[int]) -> bool:
+        """Lock a random gallery person not in exclude_ids. False when nobody is left."""
+        person_id = choose_random_person(self.gallery.confirmed_ids(), exclude_ids)
+        if person_id is None:
+            return False
+        return self._select_person(person_id)
+
+    def _give_up_on_target(self) -> None:
+        """Full search turn without the target. Next random person not tried yet; nobody left -> rescan."""
+        if self._selected_person_id is not None:
+            self._tried_person_ids.add(self._selected_person_id)
+            print(f"[INFO] P{self._selected_person_id} not found in a full turn")
+        if not self._pick_random_target(self._tried_person_ids):
+            print("[INFO] Nobody from the scan found again -> rescan")
+            self.gallery.clear()
+            self.lock.clear()
+            self._selected_person_id = None
+            self._reset_tracking_state()
+            self._start_scan()
 
     def set_target(self, name: str) -> bool:
         """Swap active target. Returns False on unknown name. Resets PIDs+EMA (new setpoints would spike)."""
@@ -348,6 +468,12 @@ class TelloInterceptor:
             "num_detections":  self._last_persons_count,
             "reid_available":  self.reid is not None,
             "search_state":    self._search_state,
+            "mission_phase":   self._mission_phase,
+            "scan_turned_deg": round(self._scan_turned_deg, 1),
+            "gallery_version": self.gallery.version,
+            "gallery_count":   len(self.gallery.confirmed_ids()),
+            "selected_person_id": self._selected_person_id,
+            "target_spin_turned_deg": round(self._target_spin_turned_deg, 1),
             "target_name":     getattr(TARGET, "name", "—"),
             "available_targets": list(AVAILABLE_TARGETS.keys()),
         }
@@ -409,6 +535,7 @@ class TelloInterceptor:
         threading.Thread(target=self._update_telemetry, daemon=True).start()
         threading.Thread(target=self._update_front_tof, daemon=True).start()
         threading.Thread(target=self._rc_control_loop, daemon=True).start()
+        self.led_matrix.start()
 
         self._video_loop()
 
@@ -423,6 +550,11 @@ class TelloInterceptor:
         self.rc_loop_active = False
         self.video_active = False
         self.telemetry_active = False
+
+        # Gallery is RAM only — drop it on exit. LED thread clears the matrix, then ends.
+        self.gallery.clear()
+        self.lock.clear()
+        self.led_matrix.stop()
 
         time.sleep(1.5)  # > EXT tof? timeout (1s) so ToF thread fully exits
 
@@ -482,6 +614,10 @@ class TelloInterceptor:
 
             # leer cada frame del stream de video
             current_frame = drone_video.frame
+            # New frame object = fresh video (same object = decoder stalled).
+            if current_frame is not None and current_frame is not self._last_raw_frame:
+                self._last_raw_frame = current_frame
+                self._last_frame_time = time.time()
             # djitellopy returns RGB (PyAV default); cv2 and YOLO expect BGR.
             if current_frame is not None:
                 current_frame = cv2.cvtColor(current_frame, cv2.COLOR_RGB2BGR)
@@ -539,10 +675,58 @@ class TelloInterceptor:
                         print(f"[WARN] ReID embed_batch failed; skipping lock match: {exc}")
                         embeddings = None
 
+            # --- Gallery: scan phase adds sightings, other phases only label persons P# ---
+            person_ids: list[Optional[int]] = [None] * len(detected_persons)
+            if embeddings is not None and detected_persons:
+                scan_recording = (self._mission_phase == "scan"
+                                  and (self._is_airborne or self.phantom_mode))
+                if scan_recording:
+                    # Only full, near-enough bodies become gallery references. A bbox at the frame edge is half
+                    # a body entering/leaving the turning view, a tiny one is noise -> both split one person in 2-3.
+                    edge_px = GALLERY_EDGE_MARGIN_RATIO * w
+                    min_height_px = GALLERY_MIN_BBOX_HEIGHT_RATIO * h
+                    keep = [i for i, p in enumerate(detected_persons)
+                            if p.x1 > edge_px and p.x2 < w - edge_px and p.bbox_height_pixels >= min_height_px]
+                    if keep:
+                        kept_ids = self.gallery.add_frame(
+                            embeddings[keep],
+                            [float(detected_persons[i].bbox_center_x) for i in keep],
+                            [detected_persons[i].bbox_confidence for i in keep],
+                            [bearing_of_person_deg(detected_persons[i], self._scan_turned_deg, w) for i in keep],
+                        )
+                        for i, person_id in zip(keep, kept_ids):
+                            person_ids[i] = person_id
+                else:
+                    person_ids = self.gallery.identify(embeddings)
+
+            # --- Apply pending gallery intents ---
+            if self._rescan_pending:
+                self._rescan_pending = False
+                self.gallery.clear()
+                self.lock.clear()
+                self._selected_person_id = None
+                self._reset_tracking_state()
+                self._start_scan()
+                person_ids = [None] * len(detected_persons)
+
+            # CAMBIAR OBJETIVO: random other person from the scan. New round — only the current one is excluded.
+            # Scan still running -> ignored, the scan end picks anyway.
+            if self._change_target_pending:
+                self._change_target_pending = False
+                if self._mission_phase != "scan":
+                    current = self._selected_person_id
+                    self._tried_person_ids = {current} if current is not None else set()
+                    if not self._pick_random_target(self._tried_person_ids):
+                        print("[INFO] Change target: no other person in the scan")
+
             # --- Apply pending lock intents ---
             if self._lock_pending_clear:
                 self.lock.clear()
                 self._lock_pending_clear = False
+                self._selected_person_id = None
+                # Track phase needs a lock — no lock -> hover and wait for a new selection.
+                if self._mission_phase == "track" and self.reid is not None:
+                    self._mission_phase = "wait"
 
             if self._lock_pending_at is not None and embeddings is not None and detected_persons:
                 x_norm, y_norm = self._lock_pending_at
@@ -557,6 +741,8 @@ class TelloInterceptor:
                     center = (float(detected_persons[hit_idx].bbox_center_x),
                               float(detected_persons[hit_idx].bbox_center_y))
                     self.lock.lock_from(embeddings[hit_idx], center)
+                    self._selected_person_id = person_ids[hit_idx]
+                    self._mission_phase = "track"
                     print(f"[INFO] Lock at ({click_px},{click_py}) -> person #{hit_idx}")
                 else:
                     print(f"[INFO] Lock click at ({click_px},{click_py}) hit no bbox")
@@ -585,6 +771,8 @@ class TelloInterceptor:
                 center = (float(detected_persons[target_idx].bbox_center_x),
                           float(detected_persons[target_idx].bbox_center_y))
                 self.lock.lock_from(embeddings[target_idx], center)
+                self._selected_person_id = person_ids[target_idx]
+                self._mission_phase = "track"
                 print(f"[INFO] Lock cycle -> person #{target_idx}")
                 self._lock_pending_cycle = False
 
@@ -593,9 +781,13 @@ class TelloInterceptor:
                 (self._target_smoothed_x_px, self._target_smoothed_y_px)
                 if self._target_ema_initialized else None
             )
-            best_person, best_idx, lock_dist = select_target_person(
-                detected_persons, TARGET, self.lock, embeddings, last_point_px,
-            )
+            # Scan / wait track nobody — no chosen person, no green box.
+            if self._mission_phase == "track":
+                best_person, best_idx, lock_dist = select_target_person(
+                    detected_persons, TARGET, self.lock, embeddings, last_point_px,
+                )
+            else:
+                best_person, best_idx, lock_dist = None, None, -1.0
             self._last_persons_count = len(detected_persons)
             self._last_lock_distance = lock_dist
             self._last_lock_idx = best_idx
@@ -613,12 +805,14 @@ class TelloInterceptor:
             # UI frame copy BEFORE HUD lands on current_frame.
             ui_frame = current_frame.copy()
             draw_person_overlays(ui_frame, persons_to_draw, TARGET,
-                                 chosen_idx=best_idx, locked=self.lock.is_locked)
+                                 chosen_idx=best_idx, locked=self.lock.is_locked,
+                                 person_ids=person_ids)
 
             # HUD overlays
             target_x_px, target_y_px, tracking_target, tracked_person = draw_person_overlays(
                 current_frame, persons_to_draw, TARGET,
                 chosen_idx=best_idx, locked=self.lock.is_locked,
+                person_ids=person_ids,
             )
 
             draw_frame_crosshair(current_frame, frame_center_x, frame_center_y)
@@ -689,11 +883,73 @@ class TelloInterceptor:
                 self._closeness_ema_initialized = False
                 self._bbox_ema_initialized = False
 
+            # Takeoff scan -> SCANNING: baro altitude hold + slow CW yaw for one full turn.
+            elif self._mission_phase == "scan":
+                mode_label = "scanning"
+                error_altitude = TARGET_ALTITUDE_CM - self.height_cm
+                ud = self.altitude_pid.compute(error_altitude, RC_LOOP_INTERVAL_S)
+                error_yaw = 0.0
+                error_pitch = 0.0
+                self.altitude_target_pid.reset_integral()
+                self.yaw_pid.reset_integral()
+                self.pitch_pid.reset_integral()
+                self.pitch_bbox_pid.reset_integral()
+                self.roll_pid.reset_integral()
+
+                if self._is_toggling_flight:
+                    # Takeoff still running — turn starts after it, timeout counts from then.
+                    # No climb command either: takeoff() holds the SDK lock for seconds, the integral would
+                    # wind up and the saturated ud would fling the drone up once the RC loop resumes.
+                    yaw = 0.0
+                    ud = 0.0
+                    self.altitude_pid.reset_integral()
+                    self._scan_t0 = time.time()
+                else:
+                    yaw = SCAN_YAW_VELOCITY_DEG_S
+
+                    # Turn progress. Real flight: IMU yaw, unwrapped across ±180. Phantom: commanded rate.
+                    if self.phantom_mode:
+                        self._scan_turned_deg += SCAN_YAW_VELOCITY_DEG_S * RC_LOOP_INTERVAL_S
+                    else:
+                        if self._scan_yaw_last_deg is None:
+                            self._scan_start_yaw_deg = self.yaw_deg
+                            self._scan_yaw_last_deg = self.yaw_deg
+                        yaw_step_deg = (self.yaw_deg - self._scan_yaw_last_deg + 540.0) % 360.0 - 180.0
+                        self._scan_yaw_last_deg = self.yaw_deg
+                        self._scan_unwrapped_deg += yaw_step_deg
+                        # abs() — sign-agnostic, the scan only turns one way.
+                        self._scan_turned_deg = abs(self._scan_unwrapped_deg)
+
+                    scan_timed_out = (time.time() - self._scan_t0) > SCAN_TIMEOUT_S
+                    if self._scan_turned_deg >= SCAN_TURN_DEG or scan_timed_out:
+                        yaw = 0.0
+                        merged = self.gallery.merge_duplicates()
+                        print(f"[INFO] Scan done ({self._scan_turned_deg:.0f} deg, timeout={scan_timed_out}). "
+                              f"Persons: {len(self.gallery.confirmed_ids())} (merged {merged} duplicates)")
+                        # Chase a random scanned person from the next tick. Nobody found -> scan again.
+                        if not self._pick_random_target(set()):
+                            self._start_scan()
+
+            # Scan found nobody -> WAITING: hover in place, baro altitude hold, no tracking. REESCANEAR retries.
+            elif self._mission_phase == "wait":
+                mode_label = "waiting"
+                error_altitude = TARGET_ALTITUDE_CM - self.height_cm
+                ud = self.altitude_pid.compute(error_altitude, RC_LOOP_INTERVAL_S)
+                error_yaw = 0.0
+                error_pitch = 0.0
+                self.altitude_target_pid.reset_integral()
+                self.yaw_pid.reset_integral()
+                self.pitch_pid.reset_integral()
+                self.pitch_bbox_pid.reset_integral()
+                self.roll_pid.reset_integral()
+
             # Target visible -> INTERCEPTING mode
             elif tracking_target:
                 # Refresh only on raw detection so grace timer measures true loss duration.
                 if tracking_target_raw:
                     self._last_target_seen_time = time.time()
+                    # Target found -> new round, every scanned person can be picked again.
+                    self._tried_person_ids = set()
                 mode_label = "intercepting"
 
                 # Reset Search if target re-acquired after loss
@@ -855,8 +1111,38 @@ class TelloInterceptor:
                 error_pitch = 0.0
                 pitch_source = "none"
 
-                # Search FSM
-                if self._search_state == "none":
+                # Locked on a scanned person -> spin in place until the lock matches (intercept branch takes over).
+                # One full turn without a match -> give up, next random person; nobody left -> rescan.
+                if self.lock.is_locked:
+                    if self._search_state != "target_spin":
+                        self._search_state = "target_spin"
+                        self._target_spin_t0 = time.time()
+                        self._target_spin_turned_deg = 0.0
+                        self._target_spin_unwrapped_deg = 0.0
+                        self._target_spin_yaw_last_deg = None
+
+                    # Spin toward last-seen side / scan bearing. Default 0 -> +1 (CW).
+                    spin_sign = self._last_target_side if self._last_target_side != 0 else 1
+                    yaw = spin_sign * SEARCH_SPIN_VELOCITY_DEG_S
+                    fb  = 0.0
+
+                    if self.phantom_mode:
+                        self._target_spin_turned_deg += SEARCH_SPIN_VELOCITY_DEG_S * RC_LOOP_INTERVAL_S
+                    else:
+                        if self._target_spin_yaw_last_deg is None:
+                            self._target_spin_yaw_last_deg = self.yaw_deg
+                        yaw_step_deg = (self.yaw_deg - self._target_spin_yaw_last_deg + 540.0) % 360.0 - 180.0
+                        self._target_spin_yaw_last_deg = self.yaw_deg
+                        self._target_spin_unwrapped_deg += yaw_step_deg
+                        self._target_spin_turned_deg = abs(self._target_spin_unwrapped_deg)
+
+                    spin_timed_out = (time.time() - self._target_spin_t0) > TARGET_SPIN_TIMEOUT_S
+                    if self._target_spin_turned_deg >= TARGET_SPIN_TURN_DEG or spin_timed_out:
+                        yaw = 0.0
+                        self._give_up_on_target()
+
+                # Search FSM (unlocked = ReID unavailable): spin 360° then advance.
+                elif self._search_state == "none":
                     self._search_state = "spin"
                     self._search_sub_state_t0 = time.time()
                     self._search_spin_angle_deg = 0.0
@@ -973,6 +1259,23 @@ class TelloInterceptor:
                 self.pitch_pid.reset_integral()
                 self.pitch_bbox_pid.reset_integral()
 
+            # Link safety — video or state frozen while flying (WiFi drop) -> hover. rc values persist on the
+            # Tello, so stale height / detections would keep the last climb or advance running into the ceiling.
+            now = time.time()
+            link_stale = (self._is_airborne and not self.phantom_mode
+                          and (now - self._last_state_time > LINK_STALE_S
+                               or now - self._last_frame_time > LINK_STALE_S))
+            if link_stale:
+                mode_label = "link_lost"
+                lr = fb = ud = yaw = 0
+                self.altitude_pid.reset_integral()
+                self.altitude_target_pid.reset_integral()
+                self.yaw_pid.reset_integral()
+                self.pitch_pid.reset_integral()
+                self.pitch_bbox_pid.reset_integral()
+                self.roll_pid.reset_integral()
+            self._video_tick_time = now
+
             self.rc[0] = int(round(lr))
             self.rc[1] = int(round(fb))
             self.rc[2] = int(round(ud))
@@ -987,6 +1290,7 @@ class TelloInterceptor:
             # UI frame = minimal overlays. cv2 shows fully-annotated. Atomic assign, no lock.
             self.latest_frame = ui_frame
             self.current_mode_label = mode_label
+            self.led_matrix.show(mode_label)
 
             if not self.headless:
                 cv2.imshow("TelloInterceptor", current_frame)
@@ -1027,6 +1331,8 @@ class TelloInterceptor:
                                 if self._is_airborne:
                                     # Optimistic: land() executes at hardware level even if SDK raises. Flip flag first.
                                     self._is_airborne = False
+                                    # Land drops the gallery (RAM only); next takeoff scans again.
+                                    self._rescan_pending = True
                                     self.tello.land()
                                 else:
                                     # Optimistic: drone lifts before djitellopy confirms over UDP. Stale queue can raise.
@@ -1040,6 +1346,8 @@ class TelloInterceptor:
                                     self.pitch_pid.reset_integral()
                                     self.pitch_bbox_pid.reset_integral()
                                     self.roll_pid.reset_integral()
+                                    # Fresh gallery + 360° scan on every takeoff.
+                                    self._rescan_pending = True
                                     self.tello.takeoff()
                         except TelloException as e:
                             # Flag already flipped. Hardware likely executed; SDK raised on queue race.
@@ -1145,6 +1453,10 @@ class TelloInterceptor:
             try:
                 # Front ToF — short critical section, release lock immediately.
                 with self._sdk_lock:
+                    # Drop stale replies (fire-and-forget LED "mled ok", late answers) so this query reads its own.
+                    responses = self.tello.get_own_udp_object().get('responses')
+                    if responses:
+                        responses.clear()
                     raw = self.tello.send_command_with_return("EXT tof?", timeout=1)
                 if raw and raw.strip().startswith("tof "):
                     mm = int(raw.strip().split()[1])
@@ -1180,6 +1492,10 @@ class TelloInterceptor:
         while self.telemetry_active:
             try:
                 state = self.tello.get_current_state()
+                # New dict object = fresh state packet (djitellopy re-parses each packet).
+                if state and state is not self._last_state_obj:
+                    self._last_state_obj = state
+                    self._last_state_time = time.time()
                 if state:
                     self.pitch_deg       = state.get("pitch", -1)
                     self.roll_deg        = state.get("roll",  -1)
@@ -1202,6 +1518,11 @@ class TelloInterceptor:
         """Send RC at 20 Hz, decoupled from video FPS. Phantom mode = no-op (rc[] still updates for HUD)."""
         while self.rc_loop_active:
             if not self.phantom_mode and self._is_airborne:
+                # Link safety — no fresh state, or video loop stuck -> hover instead of repeating the last rc.
+                now = time.time()
+                link_stale = (now - self._last_state_time > LINK_STALE_S
+                              or now - self._video_tick_time > LINK_STALE_S)
+                rc = (0, 0, 0, 0) if link_stale else tuple(self.rc)
                 with self._sdk_lock:
-                    self.tello.send_rc_control(*self.rc)
+                    self.tello.send_rc_control(*rc)
             time.sleep(RC_LOOP_INTERVAL_S)  # 0.05 s -> 20 Hz
